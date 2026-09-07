@@ -165,11 +165,15 @@ impl ClickhouseSink {
             settings.push(("wait_for_async_insert", "1"));
         }
 
+        // Content-Length 必须自己写。body 为空时（`SELECT 1`、`EXISTS TABLE` 这些
+        // 健康检查）hyper 认为流已经结束，既不发 Content-Length 也不用 chunked，
+        // 而 ClickHouse 见到这样的 POST 直接回 411 Length Required。
         let mut request = self
             .client
             .post(&self.endpoint)
             .query(&settings)
             .timeout(self.timeout)
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
             .body(body);
 
         if let (Some(user), Some(password)) = (&self.user, &self.password) {
