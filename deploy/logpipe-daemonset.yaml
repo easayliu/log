@@ -1,0 +1,130 @@
+# 每个节点一个 logpipe，采集本机所有容器的 stdout/stderr 写进 ClickHouse。
+# 不需要访问 API server —— namespace/pod/container 都是从日志路径解出来的，
+# 所以也不需要 ServiceAccount / RBAC。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logpipe-config
+  namespace: logging
+data:
+  logpipe.yaml: |
+    # 采集本机所有容器的 stdout/stderr。
+    # 路径、日志格式、元数据都不用配 —— 只按 k8s 的口径声明「采哪些」。
+
+    source:
+      type: kubernetes
+      # 留空 = 全采。下面几项都支持 glob
+      namespaces: []
+      exclude_namespaces: ["kube-*"]
+      pods: []
+      exclude_pods: []
+      containers: []
+      exclude_containers: [istio-proxy, linkerd-proxy]
+      # 位点落在宿主机上，Pod 重建后续读
+      data_dir: /var/lib/logpipe
+      # 以下都有默认值，一般不用写：
+      # log_dir: /var/log/pods       kubelet 标准路径
+      # exclude_self: true           不采自己
+      # read_from_beginning: false   只收增量，不灌历史日志
+      # glob_interval_secs: 10       多久扫一次新容器
+
+    sink:
+      type: clickhouse
+      endpoint: http://clickhouse.logging.svc.cluster.local:8123
+      database: logs
+      table: app_log
+      user: default
+      password: ""
+      timeout_secs: 30
+
+    batch:
+      max_events: 20000
+      timeout_secs: 2
+
+    pipeline:
+      require_healthy: true
+      # 写不进去就停下、位点不推进，Pod 重启后重读，不丢数据
+      on_error: stop
+
+    fields:
+      cluster: bj-prod
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: logpipe
+  namespace: logging
+spec:
+  selector:
+    matchLabels:
+      app: logpipe
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: logpipe
+    spec:
+      # 容器日志文件是 root 0600，必须以 root 读
+      securityContext:
+        runAsUser: 0
+      # 每个节点都要采，包括打了污点的
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: logpipe
+          # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
+          image: ghcr.io/easayliu/log:v0.1.0
+          args: ["/etc/logpipe/logpipe.yaml"]
+          env:
+            - name: RUST_LOG
+              value: info
+            # 用于「不采自己」。不注入也能工作：容器里的 hostname 就是 pod 名
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/logpipe
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            # 有些运行时 /var/log/pods 里是软链，指向 /var/lib/containerd，一并挂上
+            - name: varlibcontainerd
+              mountPath: /var/lib/containerd
+              readOnly: true
+            # 位点落在宿主机上，Pod 重建后能续读
+            - name: checkpoints
+              mountPath: /var/lib/logpipe
+      volumes:
+        - name: config
+          configMap:
+            name: logpipe-config
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: varlibcontainerd
+          hostPath:
+            path: /var/lib/containerd
+            type: DirectoryOrCreate
+        - name: checkpoints
+          hostPath:
+            path: /var/lib/logpipe
+            type: DirectoryOrCreate

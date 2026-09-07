@@ -1,0 +1,66 @@
+# logpipe 配置示例：采集 Java 应用日志写入 ClickHouse。
+# 启动: logpipe logpipe.yaml    建表: logpipe --ddl logpipe.yaml
+
+source:
+  # file = 自己写路径；采容器 stdout 请用 kubernetes（见 deploy/logpipe-k8s.yaml）
+  type: file
+  # 要采集的文件，支持 glob
+  include:
+    - /var/log/app/*.log
+  exclude:
+    - "*.gz"
+    - "*.1"
+  # 位点目录：重启后从上次成功入库的位置继续。不填则每次重新开始。
+  # 必须是运行用户可写的；线上部署一般用 /var/lib/logpipe（需要 root）
+  data_dir: ./.logpipe
+  # 新文件从头读；只想收增量就改成 false
+  read_from_beginning: true
+  glob_interval_secs: 10
+  # raw（默认，直接是应用日志）| cri（自己指定容器日志路径时用；
+  # 采整机容器日志用 type: kubernetes 更省事）
+  container_format: raw
+  # host: 覆盖主机名，默认取本机 hostname
+
+parser:
+  # 默认就是我们的 logback 格式，需要改格式时才填 pattern，
+  # 命名捕获组：timestamp / level / trace_id / span_id / thread / logger / message
+  # pattern: '^(?P<timestamp>\S+ \S+)\s+\[(?P<thread>[^\]]*)\]\s+(?P<level>[A-Z]+)\s+(?P<logger>\S+)\s*-?\s?(?P<message>.*)$'
+  # 时间戳原样落库（日志写 11:04 库里就是 11:04），不做时区换算
+
+# sink 的字段跟着 type 走，两段二选一（注意别混着填）
+sink:
+  type: console
+  encoding: json           # json = 和落库一致的一行 JSON；text = 还原成原始日志样式
+
+# 要入库就把上面两行注掉，改用这段：
+# sink:
+#   type: clickhouse
+#   endpoint: http://127.0.0.1:8123
+#   database: logs
+#   table: app_log
+#   user: default
+#   password: ""
+#   async_insert: false    # 打开后由 ClickHouse 服务端再攒一层批
+#   timeout_secs: 30
+
+batch:
+  max_events: 20000
+  max_bytes: 8388608
+  timeout_secs: 2
+
+retry:
+  max_attempts: 5
+  initial_backoff_ms: 500
+  max_backoff_secs: 30
+
+pipeline:
+  buffer: 64
+  # ClickHouse 连不上就不启动
+  require_healthy: true
+  # 重试耗尽后：stop = 停下且位点不推进（重启重来）；drop = 丢掉继续跑
+  on_error: stop
+
+# 附加到每条日志上的静态字段（--ddl 会自动带上对应的列）
+fields:
+  app: order-service
+  env: prod
