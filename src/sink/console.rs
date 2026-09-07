@@ -48,22 +48,22 @@ impl Default for ConsoleSink {
 #[async_trait]
 impl Sink for ConsoleSink {
     async fn write(&mut self, events: &[LogEvent]) -> Result<()> {
-        let mut buf = String::with_capacity(events.len() * 256);
+        let mut buf: Vec<u8> = Vec::with_capacity(events.len() * 256);
         for event in events {
             match self.encoding {
-                Encoding::Json => buf.push_str(&event.to_json_line()?),
-                Encoding::Text => buf.push_str(&event.to_text_line()),
+                Encoding::Json => serde_json::to_writer(&mut buf, event)?,
+                Encoding::Text => buf.extend_from_slice(event.to_text_line().as_bytes()),
             }
-            buf.push('\n');
+            buf.push(b'\n');
         }
 
         match &mut self.target {
             Target::Stdout(out) => {
-                out.write_all(buf.as_bytes()).await?;
+                out.write_all(&buf).await?;
                 out.flush().await?;
             }
             Target::Stderr(out) => {
-                out.write_all(buf.as_bytes()).await?;
+                out.write_all(&buf).await?;
                 out.flush().await?;
             }
         }

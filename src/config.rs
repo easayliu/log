@@ -135,6 +135,9 @@ pub enum SinkConfig {
         password: Option<String>,
         #[serde(default)]
         async_insert: bool,
+        /// gzip 压缩 INSERT 请求体，默认开。只有中间代理不能正确转发压缩 body 时才关。
+        #[serde(default = "yes")]
+        compress: bool,
         #[serde(default = "thirty")]
         timeout_secs: u64,
     },
@@ -387,6 +390,7 @@ impl Config {
             user,
             password,
             async_insert,
+            compress,
             timeout_secs,
         } = &self.sink
         else {
@@ -395,7 +399,8 @@ impl Config {
 
         let mut sink = ClickhouseSink::new(endpoint, database, table)
             .timeout(Duration::from_secs(*timeout_secs))
-            .async_insert(*async_insert);
+            .async_insert(*async_insert)
+            .compress(*compress);
         if let Some(cluster) = cluster {
             sink = sink.cluster(cluster);
         }

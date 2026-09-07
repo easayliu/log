@@ -40,7 +40,7 @@ pub struct FileSource {
     excludes: Vec<String>,
     data_dir: Option<PathBuf>,
     parser: Arc<dyn Parser>,
-    host: Arc<String>,
+    host: Arc<str>,
     container_format: ContainerFormat,
     pod_selector: Option<PodSelector>,
     read_from_beginning: bool,
@@ -64,7 +64,7 @@ impl FileSource {
             excludes: Vec::new(),
             data_dir: None,
             parser: Arc::new(RegexParser::new()),
-            host: Arc::new(hostname()),
+            host: Arc::from(hostname()),
             container_format: ContainerFormat::Raw,
             pod_selector: None,
             read_from_beginning: true,
@@ -159,7 +159,7 @@ impl FileSource {
     }
 
     pub fn host(mut self, host: impl Into<String>) -> Self {
-        self.host = Arc::new(host.into());
+        self.host = Arc::from(host.into());
         self
     }
 
@@ -179,6 +179,14 @@ impl FileSource {
         for watcher in watchers.values_mut() {
             watcher.seen = false;
         }
+
+        // 只有首轮、且不从头读时才需要问「这个目录以前采过吗」。一次性收成集合，
+        // 否则每个新文件都要线性扫一遍全部位点，文件多的节点启动是 O(n²)。
+        let checkpoint_dirs = if first_pass && !self.read_from_beginning {
+            checkpointer.dirs()
+        } else {
+            HashSet::new()
+        };
 
         // 先把这一轮的文件收齐，再按 mtime 从旧到新处理：轮转出来的旧文件排在当前
         // 文件前面，读出来的顺序才和写进去的顺序一致。
@@ -255,7 +263,9 @@ impl FileSource {
                 // 免得把整个节点的历史日志灌一遍。
                 None if self.read_from_beginning
                     || !first_pass
-                    || path.parent().is_some_and(|dir| checkpointer.has_dir(dir)) =>
+                    || path
+                        .parent()
+                        .is_some_and(|dir| checkpoint_dirs.contains(dir)) =>
                 {
                     0
                 }
@@ -301,7 +311,7 @@ impl FileSource {
                 key.clone(),
                 Watcher {
                     key,
-                    file_field: path.display().to_string(),
+                    file_field: Arc::from(path.display().to_string()),
                     path,
                     file,
                     offset: start,
@@ -333,6 +343,9 @@ impl Source for FileSource {
         // watcher 的发现顺序。按它来读，同一个容器「先轮转文件、后当前文件」的
         // 顺序才稳定；HashMap 的迭代顺序是乱的。
         let mut order: Vec<String> = Vec::new();
+        // 整个 source 共用一块读缓冲：原来每次 read() 都 `vec![0u8; 64KiB]`，
+        // 既要分配也要清零；放在 watcher 上又会变成每个文件常驻 64KiB。
+        let mut chunk = vec![0u8; READ_CHUNK];
         let mut last_glob: Option<Instant> = None;
         let mut last_save = Instant::now();
         // 已发出、等待落库回执的提交任务；退出前要等它们结束再存位点。
@@ -372,6 +385,7 @@ impl Source for FileSource {
                 };
                 let events = match watcher
                     .read(
+                        &mut chunk,
                         self.batch_lines,
                         self.max_line_bytes,
                         self.idle_flush,
@@ -522,7 +536,7 @@ fn fingerprint(path: &Path, metadata: &std::fs::Metadata) -> String {
 struct Watcher {
     key: String,
     path: PathBuf,
-    file_field: String,
+    file_field: Arc<str>,
     file: File,
     /// `buf` 首字节在文件中的偏移。
     offset: u64,
@@ -532,7 +546,7 @@ struct Watcher {
     aggregator: Aggregator,
     /// 每条日志都要带上的固定字段（k8s 元数据）。
     extra: Vec<(&'static str, String)>,
-    host: Arc<String>,
+    host: Arc<str>,
     pending_since: Option<Instant>,
     at_eof: bool,
     seen: bool,
@@ -541,6 +555,7 @@ struct Watcher {
 impl Watcher {
     async fn read(
         &mut self,
+        chunk: &mut [u8],
         max_lines: usize,
         max_line_bytes: usize,
         idle_flush: Duration,
@@ -563,9 +578,8 @@ impl Watcher {
             }
         }
 
-        let mut chunk = vec![0u8; READ_CHUNK];
         while events.len() < max_lines {
-            let n = self.file.read(&mut chunk).await?;
+            let n = self.file.read(&mut *chunk).await?;
             if n == 0 {
                 self.at_eof = true;
                 break;
@@ -635,8 +649,8 @@ impl Watcher {
     }
 
     fn decorate(&self, mut event: LogEvent) -> LogEvent {
-        event.file = self.file_field.clone();
-        event.host = self.host.as_str().to_owned();
+        event.file = Arc::clone(&self.file_field);
+        event.host = Arc::clone(&self.host);
         for (key, value) in &self.extra {
             event.insert(*key, value.clone());
         }

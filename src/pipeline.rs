@@ -66,7 +66,7 @@ impl Pipeline {
     async fn run_inner(self, shutdown: Shutdown) -> Result<()> {
         let Self {
             source,
-            mut sink,
+            sink,
             mut transforms,
             batch,
             retry,
@@ -84,6 +84,13 @@ impl Pipeline {
 
         let (tx, mut rx) = mpsc::channel(buffer);
         let source_name = source.name();
+        let sink_name = sink.name();
+
+        // 落库单独起一个任务，攒下一批和写上一批就能重叠起来。通道深度 1 =
+        // 双缓冲：一批在写、一批在攒，再多就在 send 处等着，形成对 source 的背压。
+        let (write_tx, write_rx) = mpsc::channel::<WriteBatch>(1);
+        let mut writer: JoinHandle<Result<()>> =
+            tokio::spawn(write_batches(sink, write_rx, retry, on_error));
 
         // 内部信号：外部 Ctrl-C / stop() 会转发到这里，pipeline 自己出错时也用它
         // 叫停 source，否则 source 会在没人接收的情况下空转。
@@ -101,8 +108,10 @@ impl Pipeline {
 
         let mut pending = Pending::default();
         let mut deadline: Option<Instant> = None;
+        // 写入任务提前结束时它的返回值，避免收尾时二次 await 同一个 JoinHandle。
+        let mut writer_outcome: Option<Result<()>> = None;
 
-        tracing::info!(source = source_name, sink = sink.name(), "pipeline 启动");
+        tracing::info!(source = source_name, sink = sink_name, "pipeline 启动");
 
         let result: Result<()> = async {
             loop {
@@ -129,25 +138,39 @@ impl Pipeline {
                                 deadline = Some(Instant::now() + batch.timeout);
                             }
                             if pending.is_full(&batch) {
-                                flush(&mut sink, &mut pending, &retry, on_error).await?;
+                                hand_off(&write_tx, &mut pending).await?;
                                 deadline = None;
                             }
                         }
                         // source 结束（读完 / 退出信号 / 出错），冲刷剩余数据。
                         None => {
-                            flush(&mut sink, &mut pending, &retry, on_error).await?;
+                            hand_off(&write_tx, &mut pending).await?;
                             break;
                         }
                     },
                     _ = timer => {
-                        flush(&mut sink, &mut pending, &retry, on_error).await?;
+                        hand_off(&write_tx, &mut pending).await?;
                         deadline = None;
+                    }
+                    // 写入任务只会因为「重试耗尽且 on_error = stop」提前结束。不盯着它的话，
+                    // 恰好没有新数据进来时这里会一直等下去，错误要拖到下一批才暴露。
+                    finished = &mut writer => {
+                        writer_outcome = Some(flatten(finished));
+                        break;
                     }
                 }
             }
             Ok(())
         }
         .await;
+
+        // 先让写入任务把手上的批次写完、回执发出去 —— source 还等着这些回执推进位点，
+        // 所以这一步必须排在 join source 之前。
+        drop(write_tx);
+        let writer_result = match writer_outcome {
+            Some(outcome) => outcome,
+            None => flatten(writer.await),
+        };
 
         // 通知 source 收工，并关掉接收端：它下一次发送会立刻失败，不至于卡在背压上。
         stop_source.trigger();
@@ -156,6 +179,12 @@ impl Pipeline {
         // 释放还没回执的 ack：对应批次没能落库，source 会保留原位点。
         // 必须在等 source 退出之前丢掉，否则 source 会一直等这些回执。
         drop(pending);
+
+        // 主循环拿到的多半只是「写入任务已退出」这种转述，写入任务自己的错误才是根因。
+        let result = match (result, writer_result) {
+            (_, Err(err)) | (Err(err), Ok(())) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        };
 
         match result {
             Ok(()) => flatten(source_task.await),
@@ -207,11 +236,20 @@ impl Pending {
         self.events.len() >= batch.max_events || self.bytes >= batch.max_bytes
     }
 
-    fn clear(&mut self) {
-        self.events.clear();
-        self.acks.clear();
+    fn take(&mut self) -> WriteBatch {
         self.bytes = 0;
+        WriteBatch {
+            events: std::mem::take(&mut self.events),
+            acks: std::mem::take(&mut self.acks),
+        }
     }
+}
+
+/// 交给写入任务的一批数据。
+struct WriteBatch {
+    events: Vec<LogEvent>,
+    /// 这批数据落库之后要回执的通道，source 据此推进位点。
+    acks: Vec<oneshot::Sender<()>>,
 }
 
 /// 顺序执行 transform，任一环节返回 `None` 就丢弃这条日志。
@@ -223,65 +261,85 @@ fn apply(transforms: &mut [Transform], event: LogEvent) -> Option<LogEvent> {
     Some(current)
 }
 
-async fn flush(
-    sink: &mut Box<dyn Sink>,
-    pending: &mut Pending,
-    retry: &RetryConfig,
-    on_error: OnError,
-) -> Result<()> {
-    if pending.events.is_empty() {
-        // 没有数据但可能攒了 ack（整批都被 transform 丢掉了），照样回执。
-        for ack in pending.acks.drain(..) {
-            let _ = ack.send(());
-        }
+/// 把攒好的一批交给写入任务。通道满（上一批还在写）时在这里等，也就是背压点。
+async fn hand_off(tx: &mpsc::Sender<WriteBatch>, pending: &mut Pending) -> Result<()> {
+    if pending.events.is_empty() && pending.acks.is_empty() {
         return Ok(());
     }
+    tx.send(pending.take())
+        .await
+        .map_err(|_| Error::other("写入任务已退出"))
+}
 
-    let mut attempt = 1;
-    let outcome = loop {
-        match sink.write(&pending.events).await {
-            Ok(()) => break Ok(()),
-            Err(err) if attempt < retry.max_attempts => {
-                let backoff = retry.backoff(attempt);
-                tracing::warn!(
-                    sink = sink.name(),
-                    attempt,
-                    ?backoff,
-                    %err,
-                    "写入失败，稍后重试"
-                );
-                tokio::time::sleep(backoff).await;
-                attempt += 1;
-            }
-            Err(err) => break Err(err),
+/// 独占 sink 的写入任务：按顺序把每一批写进存储，成功后回执。
+///
+/// 单独成一个任务，是为了让「攒下一批」和「写上一批」重叠起来 —— 原来 flush 是在
+/// 收数据的循环里直接 await 的，一次 ClickHouse 往返（失败时还要叠加最长 30s 退避）
+/// 期间整条链路都不收数据。
+///
+/// 任务内部**保持串行**，这一点是有意的，不要改成并发写：回执必须按批次顺序放出去。
+/// 位点是「只增不减」的，一旦让后面的批次先回执、而前面那批最终写失败，位点就越过了
+/// 根本没落库的数据，重启后这段直接丢。串行处理天然保证了这个顺序。
+async fn write_batches(
+    mut sink: Box<dyn Sink>,
+    mut batches: mpsc::Receiver<WriteBatch>,
+    retry: RetryConfig,
+    on_error: OnError,
+) -> Result<()> {
+    while let Some(batch) = batches.recv().await {
+        // 没有数据但攒了 ack（整批都被 transform 丢掉了），照样回执。这里也要排队，
+        // 不能在主循环里就地回 —— 否则会越过还在写的上一批。
+        if batch.events.is_empty() {
+            ack_all(batch.acks);
+            continue;
         }
-    };
 
-    match outcome {
-        Ok(()) => {
-            tracing::debug!(count = pending.events.len(), "落库成功");
-            // 先回 ack，source 据此推进位点。
-            for ack in pending.acks.drain(..) {
-                let _ = ack.send(());
-            }
-            pending.clear();
-            Ok(())
-        }
-        Err(err) => {
-            let count = pending.events.len();
-            match on_error {
-                OnError::Stop => {
-                    tracing::error!(count, %err, "重试耗尽，停止 pipeline（位点不推进）");
-                    Err(err)
+        let mut attempt = 1;
+        let outcome = loop {
+            match sink.write(&batch.events).await {
+                Ok(()) => break Ok(()),
+                Err(err) if attempt < retry.max_attempts => {
+                    let backoff = retry.backoff(attempt);
+                    tracing::warn!(
+                        sink = sink.name(),
+                        attempt,
+                        ?backoff,
+                        %err,
+                        "写入失败，稍后重试"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
                 }
-                OnError::Drop => {
-                    tracing::error!(count, %err, "重试耗尽，丢弃这批数据");
-                    // 不回 ack：位点留在原地，重启后这段会被重读。
-                    pending.clear();
-                    Ok(())
+                Err(err) => break Err(err),
+            }
+        };
+
+        match outcome {
+            Ok(()) => {
+                tracing::debug!(count = batch.events.len(), "落库成功");
+                ack_all(batch.acks);
+            }
+            Err(err) => {
+                let count = batch.events.len();
+                match on_error {
+                    OnError::Stop => {
+                        tracing::error!(count, %err, "重试耗尽，停止 pipeline（位点不推进）");
+                        return Err(err);
+                    }
+                    OnError::Drop => {
+                        tracing::error!(count, %err, "重试耗尽，丢弃这批数据");
+                        // 不回 ack：位点留在原地，重启后这段会被重读。
+                    }
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn ack_all(acks: Vec<oneshot::Sender<()>>) {
+    for ack in acks {
+        let _ = ack.send(());
     }
 }
 

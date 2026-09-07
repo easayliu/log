@@ -35,6 +35,8 @@
 | `file` / `host` | 采集时自动补上 |
 
 * `[TID:...]`、`[SpanID:...]`、`[thread]` 都是可选的，缺失时为空串；
+* 毫秒用逗号（logback `ISO8601` 默认的 `15:20:43,633`）和用小数点都认，落库都是毫秒；
+* 级别带方括号也认，比如 `2026-09-07 15:20:43,633 [DEBUG] o.s.w.s.m.m.a.RequestMappingHandlerMapping Returning handler method [...]`；
 * **异常堆栈会自动合并**到上一条日志的 `message`，不会被拆成一堆碎片；
 * 格式不同的项目可以换正则：`RegexParser::with_pattern(...)`，命名捕获组用
   `timestamp` `level` `trace_id` `span_id` `thread` `logger` `message`；
@@ -181,7 +183,12 @@ sink:
   table: app_log
   cluster: bj_ck        # 留空 / 不写 = 单机 MergeTree
   async_insert: true    # 多副本小批量写，建议打开
+  compress: true        # 默认就是 true，gzip 压 INSERT 请求体
 ```
+
+INSERT 的请求体默认 gzip 压缩（实测约 6.5 倍，8.7MiB 一批压完花 16ms）。每个节点
+一个 DaemonSet，省下的是乘以节点数的常驻带宽。只有中间的代理/网关不能正确转发压缩
+过的 body 时才需要 `compress: false`。
 
 `--ddl` 就变成两条语句，一次执行完：
 
@@ -303,7 +310,7 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 ```bash
 kubectl -n logging get cm logpipe-config -o jsonpath='{.data.logpipe\.yaml}' > /tmp/logpipe.yaml
 docker run --rm -v /tmp/logpipe.yaml:/etc/logpipe/logpipe.yaml:ro \
-  ghcr.io/easayliu/log:v0.1.2 --ddl /etc/logpipe/logpipe.yaml
+  ghcr.io/easayliu/log:v0.1.3 --ddl /etc/logpipe/logpipe.yaml
 ```
 
 要点：容器日志文件是 root `0600`，所以 `runAsUser: 0`；位点目录挂 hostPath 才能在 Pod

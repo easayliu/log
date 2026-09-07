@@ -14,7 +14,8 @@ use crate::source::{Source, SourceSender};
 
 pub struct StdinSource {
     parser: Arc<dyn Parser>,
-    host: String,
+    host: Arc<str>,
+    file: Arc<str>,
     batch_lines: usize,
     flush_interval: Duration,
 }
@@ -23,7 +24,8 @@ impl StdinSource {
     pub fn new() -> Self {
         Self {
             parser: Arc::new(RegexParser::new()),
-            host: super::file::hostname(),
+            host: Arc::from(super::file::hostname()),
+            file: Arc::from("stdin"),
             batch_lines: 500,
             flush_interval: Duration::from_millis(500),
         }
@@ -95,8 +97,8 @@ impl Source for StdinSource {
 
 impl StdinSource {
     fn decorate(&self, mut event: LogEvent) -> LogEvent {
-        event.file = "stdin".to_owned();
-        event.host = self.host.clone();
+        event.file = Arc::clone(&self.file);
+        event.host = Arc::clone(&self.host);
         event
     }
 }

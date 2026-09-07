@@ -6,6 +6,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::{Local, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -34,10 +35,10 @@ pub struct LogEvent {
     pub logger: String,
     /// 正文。多行日志（异常堆栈）会被合并到这里。
     pub message: String,
-    /// 采集来源文件路径。
-    pub file: String,
+    /// 采集来源文件路径。同一个文件的所有事件共享一份，见 `FileSource::decorate`。
+    pub file: Arc<str>,
     /// 采集主机名。
-    pub host: String,
+    pub host: Arc<str>,
     /// 额外字段，落库前由调用方自行追加。
     #[serde(flatten)]
     pub fields: BTreeMap<String, Value>,

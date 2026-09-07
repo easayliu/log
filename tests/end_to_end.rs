@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -103,7 +104,7 @@ async fn collects_lines_and_merges_stack_traces() {
     assert_eq!(events[0].trace_id, "e89a476882236ce0f1186d1522c8f59f");
     assert_eq!(events[0].logger, "c.a.c.service.DelayTaskService");
     assert_eq!(events[0].message, "redis延时任务触发检查,action数量0");
-    assert_eq!(events[0].file, path.display().to_string());
+    assert_eq!(&*events[0].file, path.display().to_string().as_str());
     assert!(!events[0].host.is_empty());
 
     // 异常堆栈应当并进上一条，而不是变成三条日志。
@@ -530,4 +531,91 @@ async fn write_failure_stops_pipeline_and_keeps_checkpoint() {
         .spawn();
     wait_for(|| events.lock().unwrap().len() == 1, "重跑仍能拿到数据").await;
     running.stop().await.unwrap();
+}
+
+/// 落库失败时要把 sink 自己的错误报上来。写入是在独立任务里做的，主循环先看到的
+/// 只是「写入任务已退出」，不能让这层转述盖掉真正的原因。
+#[tokio::test]
+async fn sink_error_is_reported_not_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    append(&path, &[LINE_1]);
+
+    let err = Pipeline::builder()
+        .source(source(&path, dir.path()))
+        .sink(FailingSink)
+        .batch(batch())
+        .retry(RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        })
+        .on_error(OnError::Stop)
+        .build()
+        .unwrap()
+        .spawn()
+        .wait()
+        .await
+        .expect_err("写入失败应当把 pipeline 停掉");
+
+    assert!(
+        err.to_string().contains("存储挂了"),
+        "根因被转述盖掉了: {err}"
+    );
+}
+
+struct SlowSink {
+    writes: Arc<Mutex<usize>>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl Sink for SlowSink {
+    async fn write(&mut self, _events: &[LogEvent]) -> logpipe::Result<()> {
+        tokio::time::sleep(self.delay).await;
+        *self.writes.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+/// 攒下一批要和写上一批重叠，而不是「攒满 -> 停下来写 -> 再从头攒」串成一条。
+///
+/// 攒批超时和写入耗时都取 120ms：重叠的话一批约 120ms，串行则是两段相加约 240ms，
+/// 同样的时间窗口里批数差一倍。
+#[tokio::test]
+async fn accumulation_overlaps_with_slow_writes() {
+    const STEP: Duration = Duration::from_millis(120);
+    const WINDOW: Duration = Duration::from_millis(960);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    append(&path, &[LINE_1]);
+
+    let writes = Arc::new(Mutex::new(0usize));
+    let running = Pipeline::builder()
+        .source(source(&path, dir.path()))
+        .sink(SlowSink {
+            writes: Arc::clone(&writes),
+            delay: STEP,
+        })
+        // max_events 取得足够大，保证每一批都是被 timeout 触发的
+        .batch(BatchConfig::default().max_events(1_000_000).timeout(STEP))
+        .build()
+        .unwrap()
+        .spawn();
+
+    // 持续追加，让 source 一直有东西可发
+    let start = std::time::Instant::now();
+    while start.elapsed() < WINDOW {
+        append(&path, &[LINE_1]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    running.stop().await.unwrap();
+
+    let count = *writes.lock().unwrap();
+    let serial = WINDOW.as_millis() / (STEP.as_millis() * 2); // 串行时的批数上限
+    assert!(
+        count as u128 > serial + 1,
+        "攒批与写入没有重叠：{WINDOW:?} 内只写了 {count} 批，串行也能到 {serial} 批"
+    );
 }

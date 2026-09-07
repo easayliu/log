@@ -25,7 +25,9 @@ logpipe —— 日志采集入库
 日志级别用 RUST_LOG 控制，例如 RUST_LOG=debug。
 ";
 
-#[tokio::main]
+// 解析全在 FileSource 的那一个 task 里串行跑，多起 worker 并不会更快；而默认是
+// 按机器核数起线程，DaemonSet 跑在几十核的节点上就会有几十个线程去抢那点 cpu 配额。
+#[tokio::main(worker_threads = 2)]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(

@@ -1,6 +1,6 @@
 [package]
 name = "logpipe"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Minimal log collection & ingestion framework: source -> batch -> sink"
 license = "MIT"
@@ -9,7 +9,8 @@ readme = "README.md"
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-std", "io-util", "signal"] }
 async-trait = "0.1"
-serde = { version = "1", features = ["derive"] }
+# rc：LogEvent 的 file/host 是 Arc<str>，每条事件共享而不是各自分配一份
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
@@ -19,7 +20,15 @@ thiserror = "2"
 serde_yaml_ng = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# gzip 这个 feature 只管响应解压；请求体的压缩是 flate2 做的，见 ClickhouseSink
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+# 纯 Rust 后端（miniz_oxide），不引入 C 依赖，musl 静态构建照常
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# 解析是单线程热路径，跨 crate 内联和单 CGU 对它有实打实的收益
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [[bin]]
 name = "logpipe"

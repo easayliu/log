@@ -1,6 +1,6 @@
 //! 采集位点。只有数据确认落库后才推进，进程重启时据此续读。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -77,13 +77,28 @@ impl Checkpointer {
     /// 位点只增不减：ack 可能乱序返回。
     pub fn advance(&self, key: &str, path: &Path, offset: u64) {
         let mut state = self.state.lock().unwrap();
-        let record = state.files.entry(key.to_owned()).or_insert(Record {
-            path: path.display().to_string(),
-            offset: 0,
-        });
-        if offset > record.offset {
-            record.offset = offset;
-            record.path = path.display().to_string();
+        // 快路径：记录已存在时一个字符串都不分配。`entry(key.to_owned())` 加上
+        // `or_insert(Record { path: ... })` 会无条件求值两个参数，而这是每批都走的路径。
+        if let Some(record) = state.files.get_mut(key) {
+            if offset > record.offset {
+                record.offset = offset;
+                // 轮转后路径才会变，没变就不用重新分配。
+                if Path::new(&record.path) != path {
+                    record.path = path.display().to_string();
+                }
+                self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+
+        state.files.insert(
+            key.to_owned(),
+            Record {
+                path: path.display().to_string(),
+                offset,
+            },
+        );
+        if offset > 0 {
             self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -114,6 +129,19 @@ impl Checkpointer {
             .files
             .values()
             .any(|record| Path::new(&record.path).parent() == Some(dir))
+    }
+
+    /// 位点里出现过的所有目录，一次性取走。
+    ///
+    /// 逐个文件调 [`Self::has_dir`] 是每次线性扫全表，文件多时退化成 O(n²)。
+    pub fn dirs(&self) -> HashSet<PathBuf> {
+        self.state
+            .lock()
+            .unwrap()
+            .files
+            .values()
+            .filter_map(|record| Path::new(&record.path).parent().map(Path::to_path_buf))
+            .collect()
     }
 
     /// 清掉不再需要的位点，返回清掉的条数。

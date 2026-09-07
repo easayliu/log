@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use chrono::{Local, NaiveDateTime};
+use chrono::{Local, NaiveDate, NaiveDateTime};
 use regex::Regex;
 
 use crate::error::{Error, Result};
@@ -15,15 +15,23 @@ use crate::event::LogEvent;
 /// 默认格式：
 /// `2026-09-07 11:04:08.914 [TID:xxx] [SpanID:xxx] [thread] INFO  c.a.c.Foo -消息`
 ///
-/// TID / SpanID / thread 都是可选的，缺失时对应字段为空串。
+/// TID / SpanID / thread 都是可选的，缺失时对应字段为空串。另外兼容 logback 的
+/// 两个常见变体：毫秒用逗号分隔（`ISO8601` 默认的 `15:20:43,633`）、级别带方括号
+/// （`[DEBUG]`，`%-5level` 之外的另一种写法）。
+///
+/// **正文不写成捕获组**：正则只匹配到「头部」为止，剩下的整段就是正文，按整条
+/// 匹配的结束位置切片取。写成 `(?P<message>.*)$` 的话，捕获要跟着正文一路走完，
+/// 解析耗时随正文长度线性上升 —— 实测 200B 正文慢 2 倍、2KB 慢 13 倍、20KB 慢
+/// 295 倍（0.55ms 一条），生产上只要有服务打大 payload 就会拖垮整个节点的采集。
+/// 自定义 pattern 里仍然可以写 `message` 组，[`RegexParser`] 会照旧从捕获里取。
 pub const DEFAULT_PATTERN: &str = concat!(
-    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?)",
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?)",
     r"\s+(?:\[TID:(?P<trace_id>[^\]]*)\]\s*)?",
     r"(?:\[SpanID:(?P<span_id>[^\]]*)\]\s*)?",
     r"(?:\[(?P<thread>[^\]]*)\]\s*)?",
-    r"(?P<level>[A-Z]+)\s+",
+    r"\[?(?P<level>[A-Z]+)\]?\s+",
     r"(?P<logger>\S+)",
-    r"\s*-?\s?(?P<message>.*)$",
+    r"\s*-?\s?",
 );
 
 /// 容器运行时给每行日志套的壳。
@@ -162,6 +170,9 @@ pub trait Parser: Send + Sync + 'static {
 /// 基于正则的行解析器，默认匹配我们线上的 logback 格式。
 pub struct RegexParser {
     regex: Regex,
+    /// 自定义 pattern 里是否写了 `message` 组。默认 pattern 没有，正文按整条匹配
+    /// 结束的位置切片取，见 [`DEFAULT_PATTERN`]。
+    has_message_group: bool,
 }
 
 impl RegexParser {
@@ -172,23 +183,75 @@ impl RegexParser {
     /// 自定义格式。可用的命名捕获组：`timestamp` `level` `trace_id` `span_id`
     /// `thread` `logger` `message`，全部可选。
     pub fn with_pattern(pattern: &str) -> Result<Self> {
+        let regex = Regex::new(pattern).map_err(|e| Error::config(format!("正则非法: {e}")))?;
+        let has_message_group = regex
+            .capture_names()
+            .flatten()
+            .any(|name| name == "message");
         Ok(Self {
-            regex: Regex::new(pattern).map_err(|e| Error::config(format!("正则非法: {e}")))?,
+            regex,
+            has_message_group,
         })
     }
+}
 
-    /// 解析时间戳。日志里没有时区信息，这里也不做换算：拿到的就是墙上时间。
-    fn parse_timestamp(&self, raw: &str) -> Option<NaiveDateTime> {
-        const FORMATS: [&str; 4] = [
-            "%Y-%m-%d %H:%M:%S%.f",
-            "%Y-%m-%dT%H:%M:%S%.f",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-        ];
-        FORMATS
-            .iter()
-            .find_map(|f| NaiveDateTime::parse_from_str(raw, f).ok())
+/// 解析时间戳。日志里没有时区信息，这里也不做换算：拿到的就是墙上时间。
+///
+/// 格式是定长的 `YYYY-MM-DD[ T]HH:MM:SS`，后面跟可选的小数秒（logback 的 ISO8601
+/// 用逗号分隔，所以 `.` 和 `,` 都收）。这里手写扫描而不是用 chrono 的
+/// `parse_from_str` 挨个试格式：实测 158ns -> 8ns，而这是每条日志都要走的路径。
+fn parse_timestamp(raw: &str) -> Option<NaiveDateTime> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 19
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || (bytes[10] != b' ' && bytes[10] != b'T')
+    {
+        return None;
     }
+
+    fn digits(bytes: &[u8]) -> Option<u32> {
+        let mut value = 0u32;
+        for &byte in bytes {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + (byte - b'0') as u32;
+        }
+        Some(value)
+    }
+
+    let year = digits(&bytes[0..4])? as i32;
+    let (month, day) = (digits(&bytes[5..7])?, digits(&bytes[8..10])?);
+    let (hour, minute, second) = (
+        digits(&bytes[11..13])?,
+        digits(&bytes[14..16])?,
+        digits(&bytes[17..19])?,
+    );
+
+    // 小数秒最多 9 位，按位补齐到纳秒（`.914` -> 914_000_000）。
+    let mut nano = 0u32;
+    if bytes.len() > 19 {
+        if bytes[19] != b'.' && bytes[19] != b',' {
+            return None;
+        }
+        let fraction = &bytes[20..];
+        if fraction.is_empty() || fraction.len() > 9 {
+            return None;
+        }
+        let mut scale = 100_000_000u32;
+        for &byte in fraction {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            nano += (byte - b'0') as u32 * scale;
+            scale /= 10;
+        }
+    }
+
+    NaiveDate::from_ymd_opt(year, month, day)?.and_hms_nano_opt(hour, minute, second, nano)
 }
 
 impl Default for RegexParser {
@@ -208,8 +271,18 @@ impl Parser for RegexParser {
 
         let timestamp = caps
             .name("timestamp")
-            .and_then(|m| self.parse_timestamp(m.as_str()))
+            .and_then(|m| parse_timestamp(m.as_str()))
             .unwrap_or_else(|| Local::now().naive_local());
+
+        // 头部匹配到哪里，正文就从哪里开始。见 [`DEFAULT_PATTERN`] 里为什么不用捕获组。
+        let message = if self.has_message_group {
+            caps.name("message")
+                .map(|m| m.as_str().to_owned())
+                .unwrap_or_default()
+        } else {
+            let head_end = caps.get(0).map_or(line.len(), |m| m.end());
+            line[head_end..].to_owned()
+        };
 
         Some(LogEvent {
             timestamp,
@@ -218,10 +291,7 @@ impl Parser for RegexParser {
             span_id: group("span_id"),
             thread: group("thread"),
             logger: group("logger"),
-            message: caps
-                .name("message")
-                .map(|m| m.as_str().to_owned())
-                .unwrap_or_default(),
+            message,
             ..Default::default()
         })
     }
@@ -365,6 +435,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_bracketed_level_with_comma_millis() {
+        // logback `%d{ISO8601} [%level] %logger %msg`：毫秒是逗号，级别带方括号，没有 thread
+        let event = RegexParser::new()
+            .parse("2026-09-07 15:20:43,633 [DEBUG] o.s.w.s.m.m.a.RequestMappingHandlerMapping Returning handler method [public com.jubotech.framework.domain.base.BaseResp com.jubotech.business.web.controller.UploadController.health() throws java.lang.Exception]")
+            .expect("应当匹配");
+        assert_eq!(event.level, "DEBUG");
+        assert_eq!(event.logger, "o.s.w.s.m.m.a.RequestMappingHandlerMapping");
+        assert!(event.thread.is_empty());
+        assert_eq!(
+            event.message,
+            "Returning handler method [public com.jubotech.framework.domain.base.BaseResp com.jubotech.business.web.controller.UploadController.health() throws java.lang.Exception]"
+        );
+        // 逗号毫秒也要落到时间戳里，不能被丢掉
+        assert_eq!(
+            event.timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+            "2026-09-07 15:20:43.633"
+        );
+    }
+
+    #[test]
+    fn parses_bracketed_level_after_thread() {
+        let event = RegexParser::new()
+            .parse("2026-09-07 15:20:43,633 [http-nio-8080-exec-1] [WARN] c.j.b.Foo -慢查询")
+            .expect("应当匹配");
+        assert_eq!(event.thread, "http-nio-8080-exec-1");
+        assert_eq!(event.level, "WARN");
+        assert_eq!(event.logger, "c.j.b.Foo");
+        assert_eq!(event.message, "慢查询");
+    }
+
+    #[test]
     fn stack_trace_merges_into_previous_event() {
         let mut agg = Aggregator::new(Arc::new(RegexParser::new()));
         assert!(agg.push(LINE).is_none());
@@ -427,6 +528,82 @@ mod tests {
             Aggregator::new(Arc::new(RegexParser::new())).decoder(ContainerFormat::Cri.decoder());
         let event = agg.push("这行没有 CRI 外壳").expect("兜底成条");
         assert_eq!(event.message, "这行没有 CRI 外壳");
+    }
+
+    #[test]
+    fn timestamp_variants_all_parse() {
+        // 手写定长解析要覆盖 chrono 那四种格式 + logback 的逗号毫秒
+        let cases = [
+            ("2026-09-07 11:04:08.914", "2026-09-07 11:04:08.914"),
+            ("2026-09-07T11:04:08.914", "2026-09-07 11:04:08.914"),
+            ("2026-09-07 11:04:08", "2026-09-07 11:04:08.000"),
+            ("2026-09-07T11:04:08", "2026-09-07 11:04:08.000"),
+            ("2026-09-07 11:04:08,633", "2026-09-07 11:04:08.633"),
+            ("2026-09-07 11:04:08.914293456", "2026-09-07 11:04:08.914"),
+            ("2026-09-07 11:04:08.9", "2026-09-07 11:04:08.900"),
+        ];
+        for (raw, want) in cases {
+            let got = parse_timestamp(raw).unwrap_or_else(|| panic!("应当解析 {raw}"));
+            assert_eq!(
+                got.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                want,
+                "{raw}"
+            );
+        }
+
+        // 非法输入不能悄悄变成一个错误的时间
+        for bad in [
+            "",
+            "2026-09-07",
+            "2026/09/07 11:04:08",
+            "2026-09-07x11:04:08",
+            "2026-13-07 11:04:08",            // 月份越界
+            "2026-09-07 25:04:08",            // 小时越界
+            "2026-09-07 11:04:08.",           // 有分隔符没数字
+            "2026-09-07 11:04:08.1234567890", // 小数秒超过 9 位
+            "2026-09-07 11:04:0a",
+        ] {
+            assert!(parse_timestamp(bad).is_none(), "不应解析 {bad:?}");
+        }
+    }
+
+    #[test]
+    fn message_is_sliced_not_captured() {
+        // 正文不再走捕获组，长正文也要原样取回来
+        let long = "x".repeat(50_000);
+        let event = RegexParser::new()
+            .parse(&format!(
+                "2026-09-07 11:04:08.914 [main] INFO  c.a.Foo -{long}"
+            ))
+            .expect("应当匹配");
+        assert_eq!(event.message, long);
+        assert_eq!(event.logger, "c.a.Foo");
+
+        // 正文里带分隔符样式的字符也不能被吃掉
+        let event = RegexParser::new()
+            .parse("2026-09-07 11:04:08.914 [main] INFO  c.a.Foo -a - b -c")
+            .expect("应当匹配");
+        assert_eq!(event.message, "a - b -c");
+
+        // 空正文
+        let event = RegexParser::new()
+            .parse("2026-09-07 11:04:08.914 [main] INFO  c.a.Foo -")
+            .expect("应当匹配");
+        assert_eq!(event.message, "");
+    }
+
+    #[test]
+    fn custom_pattern_with_message_group_still_works() {
+        // 自定义 pattern 写了 message 组时，仍然从捕获里取
+        let parser = RegexParser::with_pattern(
+            r"^(?P<timestamp>\S+ \S+) (?P<level>[A-Z]+) (?P<message>.*)$",
+        )
+        .unwrap();
+        let event = parser
+            .parse("2026-09-07 11:04:08.914 ERROR 出事了")
+            .expect("应当匹配");
+        assert_eq!(event.level, "ERROR");
+        assert_eq!(event.message, "出事了");
     }
 
     #[test]
