@@ -752,7 +752,11 @@ async fn fallback_lines_are_not_resent_after_restart() {
         .spawn();
     tokio::time::sleep(Duration::from_millis(400)).await;
     append(&current, &[&probe(4)]);
-    wait_for(|| second_events.lock().unwrap().len() == 1, "重启后的新日志").await;
+    wait_for(
+        || second_events.lock().unwrap().len() == 1,
+        "重启后的新日志",
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     running.stop().await.unwrap();
 

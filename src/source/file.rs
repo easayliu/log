@@ -410,10 +410,7 @@ impl Source for FileSource {
                 // stat 偶发失败都会让整轮扑空。只凭它就回收的话，位点会被 forget 掉，
                 // 下一轮重新发现时按「新文件」从 0 读，**整个文件重新入库一遍**。
                 // 安静的文件常驻 EOF，最容易中招。所以这里再确认一次文件确实不在了。
-                if !watcher.seen
-                    && watcher.at_eof
-                    && !still_present(&watcher.path, &watcher.key)
-                {
+                if !watcher.seen && watcher.at_eof && !still_present(&watcher.path, &watcher.key) {
                     finished.push(watcher.key.clone());
                 }
 
@@ -699,7 +696,9 @@ mod tests {
 
     #[test]
     fn skips_compressed_and_in_flight_rotation_files() {
-        assert!(!should_skip(Path::new("/var/log/pods/ns_pod_uid/app/0.log")));
+        assert!(!should_skip(Path::new(
+            "/var/log/pods/ns_pod_uid/app/0.log"
+        )));
         assert!(!should_skip(Path::new(
             "/var/log/pods/ns_pod_uid/app/0.log.20260907-123709"
         )));
