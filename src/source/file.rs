@@ -712,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn presence_check_distinguishes_gone_from_unreadable() {
+    fn presence_check_distinguishes_gone_from_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.log");
         std::fs::write(&path, "x").unwrap();
@@ -720,11 +720,10 @@ mod tests {
 
         assert!(still_present(&path, &key));
 
-        // 原地重建 = 换了 inode，等于原来那个文件没了
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, "y").unwrap();
-        #[cfg(unix)]
-        assert!(!still_present(&path, &key));
+        // 路径还在、但已经是重建出来的另一个文件（指纹对不上），等于原来那个没了。
+        // 这里直接拿一个不存在的指纹比，不用「删掉再建」—— ext4 会立刻复用 inode，
+        // 那样断言成不成立取决于文件系统。
+        assert!(!still_present(&path, "0-0"));
 
         std::fs::remove_file(&path).unwrap();
         assert!(!still_present(&path, &key));
