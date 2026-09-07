@@ -38,6 +38,10 @@ sink:
 #   endpoint: http://127.0.0.1:8123
 #   database: logs
 #   table: app_log
+#   # ClickHouse 集群名（system.clusters 里的那个）。填了 --ddl 就生成
+#   # ReplicatedMergeTree 本地表 app_log_local + Distributed 表 app_log，
+#   # 两条都带 ON CLUSTER；sink 还是往 table 写，写入路径不变。单机不用填。
+#   cluster: ""
 #   user: default
 #   password: ""
 #   async_insert: false    # 打开后由 ClickHouse 服务端再攒一层批

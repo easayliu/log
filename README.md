@@ -127,7 +127,8 @@ async fn main() -> logpipe::Result<()> {
 
 ## 表结构
 
-字段由程序定义（就是上面那 9 个），**建表由你自己执行**，程序不会自动建表也不会 `ALTER` ——
+字段由程序定义（上面那 9 个，外加容器元数据列和 `fields` 里的静态字段），
+**建表由你自己执行**，程序不会自动建表也不会 `ALTER` ——
 分区键、排序键、TTL、引擎这些线上细节留在你手里。启动时只做校验：`require_healthy: true`
 的情况下会 `SELECT 1` + `EXISTS TABLE`，表不存在就直接报错退出，不会白读一段日志。
 
@@ -154,11 +155,63 @@ ORDER BY (`timestamp`, `level`, `trace_id`)
 TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
 ```
 
-改分区/TTL/排序键直接改这份 SQL 就行，程序不关心。要注意两点：
+改分区/TTL/排序键直接改这份 SQL 就行，程序不关心。要注意三点：
 
-* 配置里 `fields` 加的静态字段（`app`、`env`……）**需要你自己往 DDL 里加列**。
-  插入时带了 `input_format_skip_unknown_fields=1`，表里没这列就静默跳过，不会整批失败。
+* 配置里 `fields` 加的静态字段（`cluster`、`env`……）**`--ddl` 会自动带上对应的列**，
+  类型按值推断：字符串 → `LowCardinality(String)`、整数 → `Int64`、小数 → `Float64`、
+  布尔 → `UInt8`。采容器日志时（`type: kubernetes`）`stream` / `namespace` / `pod` /
+  `container` 四列同样自动带上。
+* **但已经建好的表不会自动改。**给线上配置新加一个 `fields` 之后，要自己
+  `ALTER TABLE ... ADD COLUMN`（或者重跑 `--ddl` 对照着补）。插入时带了
+  `input_format_skip_unknown_fields=1`，表里没这列**不会报错、整批也不会失败，
+  这个字段会被静默丢掉** —— 加了字段却查不到值，先去看表结构。
 * 列名必须和字段名一致，多余的列（有默认值或 Nullable）不影响插入。
+
+### 接 ClickHouse 集群
+
+sink 就是一次 HTTP `INSERT`，所以 `endpoint` 指到 chproxy / VIP / k8s Service 都行。
+表结构上填一个集群名（`system.clusters` 里的那个，和 `fields` 里叫 `cluster`
+的静态字段没关系）：
+
+```yaml
+sink:
+  type: clickhouse
+  endpoint: http://ck-lb:8123
+  database: logs
+  table: app_log
+  cluster: bj_ck        # 留空 / 不写 = 单机 MergeTree
+  async_insert: true    # 多副本小批量写，建议打开
+```
+
+`--ddl` 就变成两条语句，一次执行完：
+
+```sql
+CREATE TABLE IF NOT EXISTS `logs`.`app_log_local` ON CLUSTER `bj_ck`
+( ... )
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/logs/app_log_local', '{replica}')
+PARTITION BY toYYYYMMDD(`timestamp`)
+ORDER BY (`timestamp`, `level`, `trace_id`)
+TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
+
+CREATE TABLE IF NOT EXISTS `logs`.`app_log` ON CLUSTER `bj_ck`
+AS `logs`.`app_log_local`
+ENGINE = Distributed(`bj_ck`, `logs`, `app_log_local`, rand());
+```
+
+* 本地表叫 `<table>_local`，存数据；`<table>` 是它上面的 Distributed 表，
+  **sink 写的还是 `table`**，写入路径和单机时一模一样。
+* `{shard}` / `{replica}` 是 ClickHouse 自己的宏，由各节点的 `macros` 配置展开，
+  不用替换。集群没配这两个宏的话，把 zk 路径改成你们的约定。
+* 分片键是 `rand()`，分布最均匀。想让同一台机器的日志落同一个分片
+  （压缩率更好、按 host 查不用跨分片）改成 `cityHash64(host)`。
+* 建库也要 `ON CLUSTER`，否则只在被连上的那个节点建出来，别的节点建本地表时会报库不存在。
+* 加 `fields` 之后补列要**补两张表**，本地表在前：
+  `ALTER TABLE logs.app_log_local ON CLUSTER bj_ck ADD COLUMN ...`，
+  再对 `logs.app_log` 来一遍 —— Distributed 表的结构是建表时拷过去的，不会跟着变。
+
+还差的是**多入口**：`endpoint` 只能填一个地址（`src/config.rs`），没有多节点轮询和
+故障转移 —— 节点挂了只会按 retry 策略重试同一个地址，重试耗尽后按 `on_error` 停机或丢。
+所以集群前面得有 LB。
 
 不想写配置文件的话，`examples/` 下有两个直接跑的例子：
 
@@ -221,10 +274,36 @@ source:
 > （pod 名带 Deployment 前缀，`pods: ["order-*"]` 基本等价于按服务选）。
 
 部署是 DaemonSet（每节点一个），`deploy/logpipe-daemonset.yaml` 可以直接 apply，
-镜像用根目录的 `Dockerfile` 构建：
+镜像用根目录的 `Dockerfile` 构建。
+
+**顺序是先建表、再起 DaemonSet** —— 配了 `require_healthy: true`，表不存在时 healthcheck
+直接失败退出，Pod 会 CrashLoopBackOff（也就 exec 不进去，别指望进容器里拿 DDL）：
 
 ```bash
+# 1. namespace + ConfigMap + DaemonSet
 kubectl apply -f deploy/logpipe-daemonset.yaml
+
+# 2. 建库建表（挂的是同一个 ConfigMap，列不会和采集端对不上）
+kubectl apply -f deploy/logpipe-ddl-job.yaml
+kubectl -n logging wait --for=condition=complete job/logpipe-ddl --timeout=180s
+
+# 3. 让第 1 步已经起来的 Pod 立刻重试，不用等 CrashLoop 退避
+kubectl -n logging rollout restart daemonset/logpipe
+```
+
+Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USER` /
+`CH_PASSWORD` 要和 ConfigMap 里 sink 的 `endpoint` / `database` / `cluster` / `user` /
+`password` 对上（接集群见上面「接 ClickHouse 集群」，`CH_CLUSTER` 留空就是单机）。DDL 是
+`CREATE TABLE IF NOT EXISTS`，重复跑无副作用，可以挂成 CI / helm 的 pre-install hook。
+**但已存在的表它不会改**：加了 `fields` 之后新列要自己 `ALTER TABLE ... ADD COLUMN`，
+详见上面「表结构」那节。
+
+不想在集群里跑 Job 的话，`--ddl` 不连库，本地也能渲染出来：
+
+```bash
+kubectl -n logging get cm logpipe-config -o jsonpath='{.data.logpipe\.yaml}' > /tmp/logpipe.yaml
+docker run --rm -v /tmp/logpipe.yaml:/etc/logpipe/logpipe.yaml:ro \
+  ghcr.io/easayliu/log:v0.1.1 --ddl /etc/logpipe/logpipe.yaml
 ```
 
 要点：容器日志文件是 root `0600`，所以 `runAsUser: 0`；位点目录挂 hostPath 才能在 Pod
@@ -315,6 +394,7 @@ pub trait Sink: Send + Sync + 'static {
 ## 还没做
 
 * Docker json-file 格式的容器日志（CRI 已支持）
+* ClickHouse 多 endpoint 轮询 / 故障转移（现在只能填一个地址，靠外面的 LB）
 * Kafka / Elasticsearch sink
 * 磁盘缓冲（现在队列在内存里，进程被杀时未落库的数据靠位点重读补回）
 * 采集指标（写入条数/失败数暂时只有 tracing 日志）

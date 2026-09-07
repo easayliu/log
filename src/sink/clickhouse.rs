@@ -15,6 +15,7 @@ pub struct ClickhouseSink {
     endpoint: String,
     database: String,
     table: String,
+    cluster: Option<String>,
     user: Option<String>,
     password: Option<String>,
     timeout: Duration,
@@ -33,11 +34,22 @@ impl ClickhouseSink {
             endpoint: endpoint.into().trim_end_matches('/').to_owned(),
             database: database.into(),
             table: table.into(),
+            cluster: None,
             user: None,
             password: None,
             timeout: Duration::from_secs(30),
             async_insert: false,
         }
+    }
+
+    /// ClickHouse 集群名（`system.clusters` 里的那个，不是 k8s 集群）。
+    ///
+    /// 配了之后建表语句变成两张表：`<table>_local` 是 `ReplicatedMergeTree`，带
+    /// `ON CLUSTER` 一次性下发到所有节点；`<table>` 是它上面的 `Distributed`，
+    /// 也就是 sink 实际写入的那张。写入路径本身不受影响 —— 还是往 `table` 里 INSERT。
+    pub fn cluster(mut self, cluster: impl Into<String>) -> Self {
+        self.cluster = Some(cluster.into());
+        self
     }
 
     pub fn auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
@@ -101,16 +113,38 @@ impl ClickhouseSink {
             .collect::<Vec<_>>()
             .join(",\n");
 
-        format!(
-            "CREATE TABLE IF NOT EXISTS `{db}`.`{table}`\n\
-             (\n{body}\n)\n\
-             ENGINE = MergeTree\n\
-             PARTITION BY toYYYYMMDD(`timestamp`)\n\
+        let layout = "PARTITION BY toYYYYMMDD(`timestamp`)\n\
              ORDER BY (`timestamp`, `level`, `trace_id`)\n\
-             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY",
-            db = self.database,
-            table = self.table,
+             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY";
+        let db = &self.database;
+        let table = &self.table;
+
+        let Some(cluster) = &self.cluster else {
+            return format!(
+                "CREATE TABLE IF NOT EXISTS `{db}`.`{table}`\n\
+                 (\n{body}\n)\n\
+                 ENGINE = MergeTree\n{layout}"
+            );
+        };
+
+        // 集群：本地表存数据，Distributed 表负责分发，两条语句都 ON CLUSTER 一次下发。
+        // `{shard}` / `{replica}` 是 ClickHouse 自己的宏，由各节点的 macros 配置展开，
+        // 不是这里要替换的东西。
+        let local = self.local_table();
+        format!(
+            "CREATE TABLE IF NOT EXISTS `{db}`.`{local}` ON CLUSTER `{cluster}`\n\
+             (\n{body}\n)\n\
+             ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{db}/{local}', '{{replica}}')\n\
+             {layout};\n\n\
+             CREATE TABLE IF NOT EXISTS `{db}`.`{table}` ON CLUSTER `{cluster}`\n\
+             AS `{db}`.`{local}`\n\
+             ENGINE = Distributed(`{cluster}`, `{db}`, `{local}`, rand())"
         )
+    }
+
+    /// 集群模式下真正存数据的本地表名：`<table>_local`。
+    pub fn local_table(&self) -> String {
+        format!("{}_local", self.table)
     }
 
     /// 执行任意 SQL（建表、查询都可以）。

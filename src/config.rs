@@ -127,6 +127,10 @@ pub enum SinkConfig {
         endpoint: String,
         database: String,
         table: String,
+        /// ClickHouse 集群名（`system.clusters` 里的，不是 k8s 集群，也和 `fields` 里
+        /// 叫 cluster 的静态字段无关）。配了之后 `--ddl` 生成 `ReplicatedMergeTree`
+        /// 本地表 + `Distributed` 表，两条都带 `ON CLUSTER`。
+        cluster: Option<String>,
         user: Option<String>,
         password: Option<String>,
         #[serde(default)]
@@ -379,6 +383,7 @@ impl Config {
             endpoint,
             database,
             table,
+            cluster,
             user,
             password,
             async_insert,
@@ -391,6 +396,9 @@ impl Config {
         let mut sink = ClickhouseSink::new(endpoint, database, table)
             .timeout(Duration::from_secs(*timeout_secs))
             .async_insert(*async_insert);
+        if let Some(cluster) = cluster {
+            sink = sink.cluster(cluster);
+        }
         if let Some(user) = user {
             sink = sink.auth(user, password.clone().unwrap_or_default());
         }
@@ -619,6 +627,62 @@ fields:
         }
         assert!(ddl.contains("`replica`   Int64"));
         config.build().unwrap();
+    }
+
+    #[test]
+    fn cluster_ddl_is_replicated_plus_distributed() {
+        let config = Config::parse(
+            r#"
+source:
+  type: kubernetes
+sink:
+  type: clickhouse
+  endpoint: http://ck-lb:8123
+  database: logs
+  table: app_log
+  cluster: bj_ck
+"#,
+        )
+        .unwrap();
+
+        let ddl = config.ddl().unwrap();
+        // 本地表存数据，Distributed 表是 sink 实际写入的那张
+        assert!(
+            ddl.contains("`logs`.`app_log_local` ON CLUSTER `bj_ck`"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("ENGINE = ReplicatedMergeTree"), "{ddl}");
+        assert!(
+            ddl.contains("Distributed(`bj_ck`, `logs`, `app_log_local`, rand())"),
+            "{ddl}"
+        );
+        // 两条语句，中间要有分号，不然 --ddl 出来的脚本没法直接执行
+        assert_eq!(ddl.matches("CREATE TABLE").count(), 2, "{ddl}");
+        assert!(ddl.contains(";"), "{ddl}");
+        // 宏留给 ClickHouse 自己展开
+        assert!(
+            ddl.contains("{shard}") && ddl.contains("{replica}"),
+            "{ddl}"
+        );
+
+        // 不配 cluster 还是单机 MergeTree
+        let single = Config::parse(
+            r#"
+source:
+  type: kubernetes
+sink:
+  type: clickhouse
+  endpoint: http://127.0.0.1:8123
+  database: logs
+  table: app_log
+"#,
+        )
+        .unwrap()
+        .ddl()
+        .unwrap();
+        assert!(single.contains("ENGINE = MergeTree"), "{single}");
+        assert!(!single.contains("ON CLUSTER"), "{single}");
+        assert!(!single.contains("app_log_local"), "{single}");
     }
 
     #[test]

@@ -39,6 +39,9 @@ data:
       endpoint: http://clickhouse.logging.svc.cluster.local:8123
       database: logs
       table: app_log
+      # ClickHouse 集群名。填了就写 Distributed 表、DDL 带 ON CLUSTER；
+      # 改了这里要同步改 logpipe-ddl-job.yaml 的 CH_CLUSTER
+      # cluster: bj_ck
       user: default
       password: ""
       timeout_secs: 30
@@ -81,7 +84,7 @@ spec:
       containers:
         - name: logpipe
           # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
-          image: ghcr.io/easayliu/log:v0.1.0
+          image: ghcr.io/easayliu/log:v0.1.1
           args: ["/etc/logpipe/logpipe.yaml"]
           env:
             - name: RUST_LOG
