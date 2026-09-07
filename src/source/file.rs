@@ -199,9 +199,8 @@ impl FileSource {
                 if excludes.iter().any(|pattern| pattern.matches_path(&path)) {
                     continue;
                 }
-                if is_compressed(&path) {
-                    // kubelet 会把轮转文件压成 .gz，这种内容读不了，只能跳过。
-                    tracing::debug!(?path, "跳过已压缩的轮转文件");
+                if should_skip(&path) {
+                    tracing::debug!(?path, "跳过压缩文件 / 压缩中间文件");
                     continue;
                 }
                 let Ok(metadata) = std::fs::metadata(&path) else {
@@ -224,7 +223,12 @@ impl FileSource {
             let key = fingerprint(&path, &metadata);
             if let Some(watcher) = watchers.get_mut(&key) {
                 watcher.seen = true;
-                watcher.path = path;
+                // 轮转（改名）后要跟着换 file 字段，否则后面读出来的内容还挂着
+                // 轮转前的路径。只在真的变了时才重新分配。
+                if watcher.path != path {
+                    watcher.file_field = Arc::from(path.display().to_string());
+                    watcher.path = path;
+                }
                 continue;
             }
 
@@ -401,7 +405,15 @@ impl Source for FileSource {
                 };
 
                 // 文件已经消失（被轮转/删除）且读到 EOF，收尾后关闭句柄。
-                if !watcher.seen && watcher.at_eof {
+                //
+                // `seen` 只说明「上一轮 glob 没扫到」，不等于文件没了：目录瞬时不可达、
+                // stat 偶发失败都会让整轮扑空。只凭它就回收的话，位点会被 forget 掉，
+                // 下一轮重新发现时按「新文件」从 0 读，**整个文件重新入库一遍**。
+                // 安静的文件常驻 EOF，最容易中招。所以这里再确认一次文件确实不在了。
+                if !watcher.seen
+                    && watcher.at_eof
+                    && !still_present(&watcher.path, &watcher.key)
+                {
                     finished.push(watcher.key.clone());
                 }
 
@@ -510,12 +522,28 @@ fn spawn_commit(
     })
 }
 
-/// kubelet 轮转后会把旧文件压掉，这些内容读不了，只能跳过。
-fn is_compressed(path: &Path) -> bool {
+/// 不是日志正文、必须跳过的文件。
+///
+/// 压缩过的轮转文件（`.gz`）内容读不了。`.tmp` 是 kubelet 压缩过程中的中间文件，
+/// 里面装的是还没改名的压缩流 —— 按文本读会解析出一堆二进制垃圾行入库。
+fn should_skip(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("gz" | "zst" | "xz" | "bz2" | "zip")
+        Some("gz" | "zst" | "xz" | "bz2" | "zip" | "tmp")
     )
+}
+
+/// 这个 watcher 盯着的文件是否还在原路径上。
+///
+/// 比 `path.exists()` 严一点：路径还在、但已经是重建出来的另一个文件（inode 变了）
+/// 时也算没了，否则会一直攥着一个已删除文件的句柄，位点也永远清不掉。
+fn still_present(path: &Path, key: &str) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => fingerprint(path, &metadata) == key,
+        // 只有明确「不存在」才算没了。权限、IO 抖动一律当作文件还在 ——
+        // 宁可多留一个 watcher，也不能误清位点，那代价是整个文件重新入库。
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// 文件指纹。Unix 下用 device + inode，改名不影响，重建文件会得到新指纹。
@@ -619,8 +647,15 @@ impl Watcher {
 
             if let Some(event) = self.aggregator.push(&line) {
                 events.push(self.decorate(event));
-                // 交出去的是上一条，新的一条从这一行开始，提交到这里是安全的。
-                self.safe_offset = line_offset;
+                self.safe_offset = if self.aggregator.has_pending() {
+                    // 交出去的是上一条，当前行成了新的一条、还没闭合，
+                    // 位点只能提交到当前行开头。
+                    line_offset
+                } else {
+                    // 没有 pending 说明交出去的就是当前行本身（解析不出时间戳的
+                    // 兜底行）。提交到行首的话，重启后这一行会被再发一遍。
+                    self.offset + start as u64
+                };
             }
             self.pending_since = None;
         }
@@ -655,5 +690,44 @@ impl Watcher {
             event.insert(*key, value.clone());
         }
         event
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_compressed_and_in_flight_rotation_files() {
+        assert!(!should_skip(Path::new("/var/log/pods/ns_pod_uid/app/0.log")));
+        assert!(!should_skip(Path::new(
+            "/var/log/pods/ns_pod_uid/app/0.log.20260907-123709"
+        )));
+        assert!(should_skip(Path::new(
+            "/var/log/pods/ns_pod_uid/app/0.log.20260907-123709.gz"
+        )));
+        // kubelet 压缩过程中的中间文件：里面是压缩流，按文本读会入库一堆二进制垃圾
+        assert!(should_skip(Path::new(
+            "/var/log/pods/ns_pod_uid/app/5.log.20260907-155201.tmp"
+        )));
+    }
+
+    #[test]
+    fn presence_check_distinguishes_gone_from_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "x").unwrap();
+        let key = fingerprint(&path, &std::fs::metadata(&path).unwrap());
+
+        assert!(still_present(&path, &key));
+
+        // 原地重建 = 换了 inode，等于原来那个文件没了
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "y").unwrap();
+        #[cfg(unix)]
+        assert!(!still_present(&path, &key));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(!still_present(&path, &key));
     }
 }

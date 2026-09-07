@@ -619,3 +619,148 @@ async fn accumulation_overlaps_with_slow_writes() {
         "攒批与写入没有重叠：{WINDOW:?} 内只写了 {count} 批，串行也能到 {serial} 批"
     );
 }
+
+/// kubelet 压缩轮转文件时会先落一个 `.tmp`，里面是压缩流。glob 是 `*.log*`，
+/// 会把它一起收进来 —— 按文本读的话，入库的是一堆二进制垃圾行。
+#[tokio::test]
+async fn compression_temp_file_is_not_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pods = dir.path().join("pods");
+    let log_dir = pods
+        .join("prod_crawler-rawdata-68fd8d887-lncvx_46354406")
+        .join("crawler-rawdata");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let current = log_dir.join("0.log");
+    std::fs::write(&current, "").unwrap();
+
+    let sink = MemorySink::new();
+    let events = sink.events();
+    let running = Pipeline::builder()
+        .source(k8s_source(&pods, dir.path()))
+        .sink(sink)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 轮转压缩发生在采集进程运行期间：这个 `.tmp` 是被盯着的时候冒出来的，
+    // 会走「新文件从头读」那条分支。里面其实是 gzip 流，这里用可读文本才好断言。
+    append(
+        &log_dir.join("5.log.20260907-155201.tmp"),
+        &[&cri(&logline(1, "压缩中间文件里的内容"))],
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    append(&current, &[&cri(&logline(2, "正常日志"))]);
+    wait_for(|| events.lock().unwrap().len() == 1, "正常日志").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    running.stop().await.unwrap();
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "`.tmp` 不该被采");
+    assert_eq!(events[0].message, "正常日志");
+}
+
+/// 轮转是改名，watcher 按 inode 续读同一个文件。`file` 字段要跟着改到新路径，
+/// 否则轮转文件里读出来的内容会挂着轮转前的路径。
+#[tokio::test]
+async fn rotated_file_reports_its_new_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let pods = dir.path().join("pods");
+    let log_dir = pods
+        .join("prod_order-service-7d9f8b6c4-abcde_1f2e3d4c")
+        .join("app");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let current = log_dir.join("0.log");
+    std::fs::write(&current, "").unwrap();
+
+    let sink = MemorySink::new();
+    let events = sink.events();
+    let running = Pipeline::builder()
+        .source(k8s_source(&pods, dir.path()))
+        .sink(sink)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    append(&current, &[&cri(&logline(1, "轮转前"))]);
+    wait_for(|| events.lock().unwrap().len() == 1, "轮转前那条").await;
+
+    let rotated = log_dir.join("0.log.20260907-030410");
+    std::fs::rename(&current, &rotated).unwrap();
+    // 等一轮 glob 认出改名，再写：否则读在发现之前，测试会飘
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    append(&rotated, &[&cri(&logline(2, "轮转后还在往旧文件里写"))]);
+    wait_for(|| events.lock().unwrap().len() == 2, "轮转后那条").await;
+    running.stop().await.unwrap();
+
+    let events = events.lock().unwrap();
+    assert_eq!(
+        &*events[0].file,
+        current.display().to_string().as_str(),
+        "轮转前采到的挂当前文件"
+    );
+    assert_eq!(
+        &*events[1].file,
+        rotated.display().to_string().as_str(),
+        "轮转后采到的要挂轮转后的路径"
+    );
+}
+
+/// 解析不出时间戳的行（nginx 访问日志、没配格式的应用）走兜底路径，交出去的就是
+/// 当前行本身。位点必须提交到行尾 —— 提交到行首的话，重启后这一行会被再发一遍。
+#[tokio::test]
+async fn fallback_lines_are_not_resent_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let pods = dir.path().join("pods");
+    let log_dir = pods
+        .join("prod_back-link-databoard-68fd775648-gwm6x_402ac03f")
+        .join("back-link-databoard");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let current = log_dir.join("0.log");
+    std::fs::write(&current, "").unwrap();
+
+    let probe = |n: u32| {
+        cri(&format!(
+            "127.0.0.6 - - [07/Sep/2026:15:57:{n:02} +0800] \"GET / HTTP/1.1\" 200 1170 \"-\" \"kube-probe/1.28+\" \"-\""
+        ))
+    };
+
+    let first = MemorySink::new();
+    let first_events = first.events();
+    let running = Pipeline::builder()
+        .source(k8s_source(&pods, dir.path()))
+        .sink(first)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    append(&current, &[&probe(1), &probe(2), &probe(3)]);
+    wait_for(|| first_events.lock().unwrap().len() == 3, "三条探针日志").await;
+    wait_for(|| state_of(dir.path()).contains("0.log"), "位点落盘").await;
+    running.stop().await.unwrap();
+
+    let second = MemorySink::new();
+    let second_events = second.events();
+    let running = Pipeline::builder()
+        .source(k8s_source(&pods, dir.path()))
+        .sink(second)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    append(&current, &[&probe(4)]);
+    wait_for(|| second_events.lock().unwrap().len() == 1, "重启后的新日志").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    running.stop().await.unwrap();
+
+    let events = second_events.lock().unwrap();
+    assert_eq!(events.len(), 1, "重启后只该采到新写的那条，不该重发上一条");
+    assert!(
+        events[0].message.contains("15:57:04"),
+        "采到的应该是新写的那条，实际是 {}",
+        events[0].message
+    );
+}
