@@ -237,9 +237,20 @@ kubectl apply -f deploy/logpipe-daemonset.yaml
 ```bash
 # 1. 先改 Cargo.toml 的 version，CI 会校验它和 tag 一致，不一致直接失败
 git commit -am "release v0.1.1"
-# 2. 打 tag 推上去
-git tag v0.1.1 && git push origin main --tags
+git push origin main
+
+# 2. tag 必须单独推，不能和分支挤在同一条 git push 里
+git tag v0.1.1
+git push origin v0.1.1
 ```
+
+> **别写 `git push origin main --tags`。**分支和 tag 在同一次 push 里上去时，GitHub 只按
+> 分支 ref 记一个事件，tag 不产生自己的事件，Actions 永远收不到 `ref_type: tag` 的 push
+> —— tag 在远端好好地待着，镜像却没人构建。踩过一次：`git ls-remote` 能看到 tag、
+> workflow 是 active、也没有 startup_failure，但 events 里只有 `PushEvent refs/heads/main`。
+>
+> 已经这样推错了的话，重复推同一个 ref 是 no-op、不会补触发，得先删远端 tag 再单独推：
+> `git push origin :refs/tags/v0.1.1 && git push origin v0.1.1`
 
 产出 `ghcr.io/easayliu/log:v0.1.1`，同时把 `:latest` 指过去（`v0.1.1-rc1` 这类预发布
 tag 不会动 `latest`）。`workflow_dispatch` 手动触发只推 `sha-<短 sha>`，用来验证流水线本身。
