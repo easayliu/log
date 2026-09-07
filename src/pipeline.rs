@@ -39,15 +39,15 @@ impl Pipeline {
         PipelineBuilder::default()
     }
 
-    /// 前台运行，直到日志读完、出错，或者收到 Ctrl-C。
+    /// 前台运行，直到日志读完、出错，或者收到退出信号（SIGINT / SIGTERM）。
     pub async fn run(self) -> Result<()> {
         let (handle, shutdown) = shutdown::channel();
         let mut task = tokio::spawn(self.run_inner(shutdown));
 
         tokio::select! {
             result = &mut task => flatten(result),
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("收到 Ctrl-C，开始收尾");
+            signal = terminate_signal() => {
+                tracing::info!(signal, "收到退出信号，开始收尾");
                 handle.trigger();
                 flatten(task.await)
             }
@@ -341,6 +341,39 @@ fn ack_all(acks: Vec<oneshot::Sender<()>>) {
     for ack in acks {
         let _ = ack.send(());
     }
+}
+
+/// 等一个「该收工了」的信号。
+///
+/// **必须同时接 SIGTERM**：k8s 终止 Pod 发的是它，不是 SIGINT。而且容器里 logpipe
+/// 就是 PID 1（Dockerfile 的 ENTRYPOINT 是 exec 形式），内核对 PID 1 不套用默认信号
+/// 动作 —— 没装 handler 的 SIGTERM 会被直接忽略，k8s 只能干等满
+/// `terminationGracePeriodSeconds` 再 SIGKILL。这期间下面这套收尾一步都跑不到：
+/// 位点不落盘、最后一批不冲刷，重启后那段会被重读一遍（重复入库）。
+#[cfg(unix)]
+async fn terminate_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        // 注册不上不至于让整个进程起不来，退回到只认 Ctrl-C。
+        Err(err) => {
+            tracing::warn!(%err, "注册 SIGTERM 处理失败，只能靠 Ctrl-C 退出");
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
 }
 
 fn flatten(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {

@@ -310,7 +310,7 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 ```bash
 kubectl -n logging get cm logpipe-config -o jsonpath='{.data.logpipe\.yaml}' > /tmp/logpipe.yaml
 docker run --rm -v /tmp/logpipe.yaml:/etc/logpipe/logpipe.yaml:ro \
-  ghcr.io/easayliu/log:v0.1.3 --ddl /etc/logpipe/logpipe.yaml
+  ghcr.io/easayliu/log:v0.1.4 --ddl /etc/logpipe/logpipe.yaml
 ```
 
 要点：容器日志文件是 root `0600`，所以 `runAsUser: 0`；位点目录挂 hostPath 才能在 Pod
