@@ -36,7 +36,7 @@ pub mod source;
 
 pub use error::{Error, Result};
 pub use event::LogEvent;
-pub use parser::{Aggregator, Parser, RegexParser};
+pub use parser::{Aggregator, ChainParser, LogFormat, LogbackParser, Parser, RegexParser};
 pub use pipeline::{Pipeline, PipelineBuilder, RunningPipeline};
 pub use shutdown::{Shutdown, ShutdownHandle};
 pub use sink::Sink;

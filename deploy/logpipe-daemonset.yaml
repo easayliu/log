@@ -34,6 +34,13 @@ data:
       # read_from_beginning: false   只收增量，不灌历史日志
       # glob_interval_secs: 10       多久扫一次新容器
 
+    parser:
+      # 节点上跑着几种语言栈就配几种，按顺序试，第一个匹配上的胜出。
+      # 漏配的那种格式不报错，只会被当成上一条日志的堆栈续行粘上去。
+      # access log 走 level（状态码折算）/ logger / message 这几个现成的列，
+      # 表结构不变，加格式不用 ALTER。
+      formats: [logback, gin, nginx]
+
     sink:
       type: clickhouse
       endpoint: http://clickhouse.logging.svc.cluster.local:8123

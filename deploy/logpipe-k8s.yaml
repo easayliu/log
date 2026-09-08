@@ -18,6 +18,10 @@ source:
   # read_from_beginning: false   只收增量，不灌历史日志
   # glob_interval_secs: 10       多久扫一次新容器
 
+parser:
+  # 整机采集通常不止一种格式，按顺序试，第一个匹配上的胜出
+  formats: [logback, gin, nginx]
+
 sink:
   type: clickhouse
   endpoint: http://clickhouse.logging.svc.cluster.local:8123

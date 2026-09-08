@@ -113,6 +113,42 @@ async fn collects_lines_and_merges_stack_traces() {
 }
 
 #[tokio::test]
+async fn static_fields_ride_along_as_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    append(&path, &[LINE_1]);
+
+    let sink = MemorySink::new();
+    let events = sink.events();
+    let fields = [
+        ("app".to_owned(), serde_json::Value::from("order-service")),
+        ("env".to_owned(), serde_json::Value::from("prod")),
+    ]
+    .into_iter()
+    .collect();
+
+    let running = Pipeline::builder()
+        .source(source(&path, dir.path()).fields(fields))
+        .sink(sink)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+
+    wait_for(|| events.lock().unwrap().len() == 1, "一条日志").await;
+    running.stop().await.unwrap();
+
+    let events = events.lock().unwrap();
+    // 静态字段不逐条拷进 fields，而是所有事件共享一份；对外看起来没有区别
+    assert!(events[0].fields.is_empty());
+    assert_eq!(events[0].get("app").unwrap(), "order-service");
+    let json: serde_json::Value = serde_json::from_str(&events[0].to_json_line().unwrap()).unwrap();
+    assert_eq!(json["app"], "order-service");
+    assert_eq!(json["env"], "prod");
+    assert_eq!(json["level"], "INFO");
+}
+
+#[tokio::test]
 async fn resumes_from_checkpoint_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.log");

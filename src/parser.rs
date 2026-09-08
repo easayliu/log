@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use chrono::{Local, NaiveDate, NaiveDateTime};
+use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
 use regex::Regex;
 
 use crate::error::{Error, Result};
@@ -167,7 +167,8 @@ pub trait Parser: Send + Sync + 'static {
     fn parse(&self, line: &str) -> Option<LogEvent>;
 }
 
-/// 基于正则的行解析器，默认匹配我们线上的 logback 格式。
+/// 基于正则的行解析器，给自定义 `pattern` 用；默认格式走 [`LogbackParser`]（同样的
+/// 语义，快一个数量级）。
 pub struct RegexParser {
     regex: Regex,
     /// 自定义 pattern 里是否写了 `message` 组。默认 pattern 没有，正文按整条匹配
@@ -195,6 +196,18 @@ impl RegexParser {
     }
 }
 
+/// 读一段定长的十进制数字，有一位不是数字就作废。
+fn digits(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + (byte - b'0') as u32;
+    }
+    Some(value)
+}
+
 /// 解析时间戳。日志里没有时区信息，这里也不做换算：拿到的就是墙上时间。
 ///
 /// 格式是定长的 `YYYY-MM-DD[ T]HH:MM:SS`，后面跟可选的小数秒（logback 的 ISO8601
@@ -210,17 +223,6 @@ fn parse_timestamp(raw: &str) -> Option<NaiveDateTime> {
         || (bytes[10] != b' ' && bytes[10] != b'T')
     {
         return None;
-    }
-
-    fn digits(bytes: &[u8]) -> Option<u32> {
-        let mut value = 0u32;
-        for &byte in bytes {
-            if !byte.is_ascii_digit() {
-                return None;
-            }
-            value = value * 10 + (byte - b'0') as u32;
-        }
-        Some(value)
     }
 
     let year = digits(&bytes[0..4])? as i32;
@@ -295,6 +297,401 @@ impl Parser for RegexParser {
             ..Default::default()
         })
     }
+}
+
+/// 默认格式的手写解析器：语义与 [`DEFAULT_PATTERN`] 一致，但不走正则引擎。
+///
+/// 正则版解析同一行要 2.3µs，其中 1.5µs 花在给几个可选的 `[...]` 组回填捕获位置上
+/// （`find` 只要 0.3µs；这种带歧义的可选组 regex 做不了 one-pass，只能退到回溯引擎）。
+/// 按格式顺序切一遍只要 0.2µs，而这是每条日志都要走的路径。自定义 `pattern`
+/// 仍然走 [`RegexParser`]，两者的等价性由测试保证。
+pub struct LogbackParser;
+
+/// 一行 logback 日志的头部，全部是对原行的切片。
+struct LogbackHead<'a> {
+    timestamp: &'a str,
+    trace_id: &'a str,
+    span_id: &'a str,
+    thread: &'a str,
+    level: &'a str,
+    logger: &'a str,
+    message: &'a str,
+}
+
+/// `\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?` 的长度。
+fn logback_timestamp_len(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 19 {
+        return None;
+    }
+    let all_digits = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
+    let shape_ok = all_digits(0..4)
+        && bytes[4] == b'-'
+        && all_digits(5..7)
+        && bytes[7] == b'-'
+        && all_digits(8..10)
+        && (bytes[10] == b' ' || bytes[10] == b'T')
+        && all_digits(11..13)
+        && bytes[13] == b':'
+        && all_digits(14..16)
+        && bytes[16] == b':'
+        && all_digits(17..19);
+    if !shape_ok {
+        return None;
+    }
+
+    let mut end = 19;
+    if end < bytes.len() && (bytes[end] == b'.' || bytes[end] == b',') {
+        let fraction = bytes[end + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        // 正则里小数是可选组：`.` 后面没有数字时组整体不匹配，紧跟着的 `\s+` 落在 `.`
+        // 上就失败了；超过 9 位时组只吃 9 位，`\s+` 落在第 10 位数字上同样失败。
+        if fraction == 0 || fraction > 9 {
+            return None;
+        }
+        end += 1 + fraction;
+    }
+    Some(end)
+}
+
+/// 取开头的 `[...]`，返回括号内的内容和后面（去掉 `\s*`）的剩余部分。
+fn logback_bracket(raw: &str) -> Option<(&str, &str)> {
+    let inner = raw.strip_prefix('[')?;
+    let end = inner.find(']')?;
+    Some((&inner[..end], inner[end + 1..].trim_start()))
+}
+
+/// `\[?(?P<level>[A-Z]+)\]?\s+(?P<logger>\S+)\s*-?\s?`，返回 (level, logger, message)。
+fn logback_level_and_rest(raw: &str) -> Option<(&str, &str, &str)> {
+    let raw = raw.strip_prefix('[').unwrap_or(raw);
+    let level_len = raw.bytes().take_while(u8::is_ascii_uppercase).count();
+    if level_len == 0 {
+        return None;
+    }
+    let level = &raw[..level_len];
+    let after = raw[level_len..]
+        .strip_prefix(']')
+        .unwrap_or(&raw[level_len..]);
+
+    // `\s+`：至少一个空白
+    let logger_start = after.trim_start();
+    if logger_start.len() == after.len() {
+        return None;
+    }
+    let logger_len = logger_start
+        .find(char::is_whitespace)
+        .unwrap_or(logger_start.len());
+    if logger_len == 0 {
+        return None;
+    }
+    let logger = &logger_start[..logger_len];
+
+    // `\s*-?\s?`
+    let mut message = logger_start[logger_len..].trim_start();
+    if let Some(rest) = message.strip_prefix('-') {
+        message = rest;
+    }
+    if let Some(first) = message.chars().next().filter(|c| c.is_whitespace()) {
+        message = &message[first.len_utf8()..];
+    }
+    Some((level, logger, message))
+}
+
+fn parse_logback_head(line: &str) -> Option<LogbackHead<'_>> {
+    let timestamp_end = logback_timestamp_len(line.as_bytes())?;
+    let timestamp = &line[..timestamp_end];
+
+    // 时间戳后面的 `\s+`
+    let after = &line[timestamp_end..];
+    let mut rest = after.trim_start();
+    if rest.len() == after.len() {
+        return None;
+    }
+
+    let mut trace_id = "";
+    let mut span_id = "";
+    let mut thread = "";
+    if let Some((body, next)) = logback_bracket(rest) {
+        if let Some(value) = body.strip_prefix("TID:") {
+            trace_id = value;
+            rest = next;
+        }
+    }
+    if let Some((body, next)) = logback_bracket(rest) {
+        if let Some(value) = body.strip_prefix("SpanID:") {
+            span_id = value;
+            rest = next;
+        }
+    }
+    // 接下来的方括号是 thread 还是 `[LEVEL]`：和正则一样先按 thread 试，后面接得上
+    // level 才算；接不上就把这个方括号本身当 `[LEVEL]` 重新解析。
+    let (level, logger, message) = match logback_bracket(rest) {
+        Some((body, next)) => match logback_level_and_rest(next) {
+            Some(tail) => {
+                thread = body;
+                tail
+            }
+            None => logback_level_and_rest(rest)?,
+        },
+        None => logback_level_and_rest(rest)?,
+    };
+
+    Some(LogbackHead {
+        timestamp,
+        trace_id,
+        span_id,
+        thread,
+        level,
+        logger,
+        message,
+    })
+}
+
+impl Parser for LogbackParser {
+    fn parse(&self, line: &str) -> Option<LogEvent> {
+        let head = parse_logback_head(line)?;
+        Some(LogEvent {
+            timestamp: parse_timestamp(head.timestamp)
+                .unwrap_or_else(|| Local::now().naive_local()),
+            level: head.level.trim().to_owned(),
+            trace_id: head.trace_id.trim().to_owned(),
+            span_id: head.span_id.trim().to_owned(),
+            thread: head.thread.trim().to_owned(),
+            logger: head.logger.trim().to_owned(),
+            message: head.message.to_owned(),
+            ..Default::default()
+        })
+    }
+}
+
+/// 日志格式。同一个节点上不同语言栈的格式不一样（Java 打 logback、Go 服务顺手
+/// 就把 gin 的 access log 打到 stdout、网关是 nginx），配置里按顺序列几个，
+/// 由 [`ChainParser`] 依次尝试。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// 我们线上的 Java 格式，见 [`DEFAULT_PATTERN`]。
+    #[default]
+    Logback,
+    /// gin 默认的 access log。
+    Gin,
+    /// nginx 的 combined access log（CLF）。
+    Nginx,
+}
+
+impl LogFormat {
+    /// 建出对应的解析器。`logback` 可以用自定义正则替掉默认 pattern。
+    pub fn parser(self, pattern: Option<&str>) -> Result<Box<dyn Parser>> {
+        Ok(match self {
+            LogFormat::Logback => match pattern {
+                Some(pattern) => Box::new(RegexParser::with_pattern(pattern)?),
+                None => Box::new(LogbackParser),
+            },
+            LogFormat::Gin => Box::new(GinParser),
+            LogFormat::Nginx => Box::new(NginxParser),
+        })
+    }
+}
+
+/// 按顺序试多个解析器，第一个匹配上的胜出。
+///
+/// 全都不匹配时返回 `None`，落到 [`Aggregator`] 的续行/兜底逻辑 —— 这也是为什么
+/// 混合格式一定要配全：没配上的那种日志会被当成上一条的堆栈粘上去。
+///
+/// 把最常见的格式放在前面。判不出格式的开销很低（logback 的正则卡在行首的
+/// `\d{4}-`，gin 比一下行首的 `[GIN]`，nginx 找不到 `[时间]` 就走），
+/// 所以列表长一点也不心疼。
+pub struct ChainParser {
+    parsers: Vec<Box<dyn Parser>>,
+}
+
+impl ChainParser {
+    pub fn new(parsers: Vec<Box<dyn Parser>>) -> Self {
+        Self { parsers }
+    }
+
+    /// 按格式列表建链。`pattern` 只作用在 `logback` 那一档上。
+    pub fn from_formats(formats: &[LogFormat], pattern: Option<&str>) -> Result<Self> {
+        let mut parsers = Vec::with_capacity(formats.len());
+        for format in formats {
+            parsers.push(format.parser(pattern)?);
+        }
+        Ok(Self::new(parsers))
+    }
+}
+
+impl Parser for ChainParser {
+    fn parse(&self, line: &str) -> Option<LogEvent> {
+        self.parsers.iter().find_map(|parser| parser.parse(line))
+    }
+}
+
+/// access log 共用的成条逻辑：状态码折算 level，**整行留在 `message` 里**。
+///
+/// 不把 status / path / latency 抽成独立字段：这张表混着业务日志，为少数行加一堆
+/// 稀疏列，换来的只是「拿日志表做访问分析」这一个场景，而那个场景本来就该单独
+/// 建表。要按状态码筛，`level` 折算已经够用；要精确到 path，从 `message` 里抠。
+fn access_event(timestamp: NaiveDateTime, logger: &str, status: u16, line: &str) -> LogEvent {
+    LogEvent {
+        timestamp,
+        level: level_of_status(status).to_owned(),
+        logger: logger.to_owned(),
+        message: line.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// access log 没有级别，用状态码折算一个，好让按 level 过滤/告警对它照样生效。
+fn level_of_status(status: u16) -> &'static str {
+    match status {
+        500.. => "ERROR",
+        400..=499 => "WARN",
+        _ => "INFO",
+    }
+}
+
+/// gin 默认的 access log：
+/// `[GIN] 2026/09/07 - 10:07:01 | 200 |      40.601µs |    172.16.250.3 | POST     "/extra_text"`
+///
+/// 手写解析而不是上正则：行首 `[GIN]` 一比就能判掉不是这个格式的行，比让正则引擎
+/// 去试要便宜，而这是每条日志都要走的路径。
+///
+/// 两个已知不管的情况：`gin.ForceConsoleColor()` 的彩色输出（状态码被 ANSI 转义
+/// 包着，解析不出，整行进 `message`）、启动时的 `[GIN-debug]` 路由表（不是 access
+/// log，本来也不该按这个折算 level）。
+pub struct GinParser;
+
+impl Parser for GinParser {
+    fn parse(&self, line: &str) -> Option<LogEvent> {
+        let rest = line.strip_prefix("[GIN]")?;
+        // 只要前两段：时间和状态码。后面的耗时 / IP / 方法 / 路径留在 message 里。
+        let mut parts = rest.split('|');
+        let timestamp = parse_gin_timestamp(parts.next()?.trim())?;
+        let status: u16 = parts.next()?.trim().parse().ok()?;
+        Some(access_event(timestamp, "gin", status, line))
+    }
+}
+
+/// nginx 的 combined access log：
+/// `127.0.0.6 - - [07/Sep/2026:18:06:53 +0800] "GET / HTTP/1.1" 200 601 "-" "kube-probe/1.28+" "-"`
+///
+/// 判定只押在 `[时间]` 和状态码这两处严格解析上：combined 前后的 `$remote_user` /
+/// `$http_x_forwarded_for` 各家改得五花八门，跳过就是了。
+pub struct NginxParser;
+
+impl Parser for NginxParser {
+    fn parse(&self, line: &str) -> Option<LogEvent> {
+        // `$remote_addr - $remote_user [$time_local] "$request" $status ...`
+        let open = line.find(" [")?;
+        let (raw_time, rest) = line[open + 2..].split_once(']')?;
+        let timestamp = parse_clf_timestamp(raw_time)?;
+
+        // 状态码在 `"$request"` 后面，先把带引号的请求行整段跳过
+        let (_request, rest) = take_quoted(rest.trim_start())?;
+        let status: u16 = rest.trim_start().split(' ').next()?.parse().ok()?;
+        Some(access_event(timestamp, "nginx", status, line))
+    }
+}
+
+/// 取出开头的 `"..."`，返回引号内的内容和后面剩下的部分。
+///
+/// 不处理转义：nginx 默认把正文里的 `"` 转成 `\x22`，不会有裸引号。
+fn take_quoted(raw: &str) -> Option<(&str, &str)> {
+    let rest = raw.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some((&rest[..end], &rest[end + 1..]))
+}
+
+/// gin 的 `2026/09/07 - 10:07:01`。gin 打的是服务本地时间，按项目口径原样取，
+/// 不做换算。
+fn parse_gin_timestamp(raw: &str) -> Option<NaiveDateTime> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 21
+        || bytes[4] != b'/'
+        || bytes[7] != b'/'
+        || &bytes[10..13] != b" - "
+        || bytes[15] != b':'
+        || bytes[18] != b':'
+    {
+        return None;
+    }
+
+    let year = digits(&bytes[0..4])? as i32;
+    let (month, day) = (digits(&bytes[5..7])?, digits(&bytes[8..10])?);
+    let (hour, minute, second) = (
+        digits(&bytes[13..15])?,
+        digits(&bytes[16..18])?,
+        digits(&bytes[19..21])?,
+    );
+    NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)
+}
+
+/// CLF 的 `07/Sep/2026:18:06:53 +0800`。
+///
+/// 带偏移时按 CRI 拆壳那套口径换成本机墙上时间（容器跑 UTC、采集端 +0800 也能
+/// 对上）；不带偏移就当本地时间。
+fn parse_clf_timestamp(raw: &str) -> Option<NaiveDateTime> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 20
+        || bytes[2] != b'/'
+        || bytes[6] != b'/'
+        || bytes[11] != b':'
+        || bytes[14] != b':'
+        || bytes[17] != b':'
+    {
+        return None;
+    }
+
+    let day = digits(&bytes[0..2])?;
+    let month = month_of_abbrev(&bytes[3..6])?;
+    let year = digits(&bytes[7..11])? as i32;
+    let (hour, minute, second) = (
+        digits(&bytes[12..14])?,
+        digits(&bytes[15..17])?,
+        digits(&bytes[18..20])?,
+    );
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
+
+    if bytes.len() == 20 {
+        return Some(naive);
+    }
+    // ` +0800`
+    if bytes.len() != 26 || bytes[20] != b' ' {
+        return None;
+    }
+    let sign = match bytes[21] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let seconds = (digits(&bytes[22..24])? * 3600 + digits(&bytes[24..26])? * 60) as i32;
+    let offset = FixedOffset::east_opt(sign * seconds)?;
+    Some(
+        offset
+            .from_local_datetime(&naive)
+            .single()?
+            .with_timezone(&Local)
+            .naive_local(),
+    )
+}
+
+fn month_of_abbrev(raw: &[u8]) -> Option<u32> {
+    Some(match raw {
+        b"Jan" => 1,
+        b"Feb" => 2,
+        b"Mar" => 3,
+        b"Apr" => 4,
+        b"May" => 5,
+        b"Jun" => 6,
+        b"Jul" => 7,
+        b"Aug" => 8,
+        b"Sep" => 9,
+        b"Oct" => 10,
+        b"Nov" => 11,
+        b"Dec" => 12,
+        _ => return None,
+    })
 }
 
 /// 行聚合器：把「一条日志跨多行」的情况（异常堆栈）拼成一个事件。
@@ -422,6 +819,62 @@ mod tests {
             event.timestamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
             "2026-09-07 11:04:08.914"
         );
+    }
+
+    /// 手写解析器和正则在所有变体上给出同样的结果。
+    #[test]
+    fn hand_parser_matches_regex() {
+        let regex = RegexParser::new();
+        let hand = LogbackParser;
+        let lines = [
+            LINE,
+            "2026-09-07 11:04:08.914 [main] WARN  c.a.Foo -启动慢",
+            "2026-09-07 15:20:43,633 [DEBUG] o.s.w.Foo Returning handler method [public x]",
+            "2026-09-07 15:20:43,633 [http-nio-8080-exec-1] [WARN] c.j.b.Foo -慢查询",
+            "2026-09-07T15:20:43.633123456 ERROR c.j.b.Foo - 带空格的分隔",
+            "2026-09-07 15:20:43 INFO c.j.b.Foo 没有横线",
+            "2026-09-07 15:20:43 INFO c.j.b.Foo  -  正文前多一个空格",
+            "2026-09-07 15:20:43 INFO c.j.b.Foo",
+            "2026-09-07 15:20:43 INFO c.j.b.Foo -",
+            "2026-09-07 15:20:43 [TID:][SpanID:][t]INFO c.j.b.Foo -紧挨着",
+            "2026-09-07 15:20:43 [SpanID:s] [TID:t] INFO c.j.b.Foo -顺序反了",
+            "2026-09-07 15:20:43 [TID: 带空格 ] INFO c.j.b.Foo -x",
+            "2026-09-07 15:20:43 [INFO] [WARN] c.j.b.Foo -两个大写括号",
+            "2026-09-07 15:20:43 [INFO logger -少个右括号",
+            "2026-09-07 15:20:43 INFO] logger -少个左括号",
+            "2026-09-07 15:20:43 [tid] [span] [thread] INFO logger -三个普通括号",
+            // 以下都不该匹配
+            "\tat com.foo.Bar.baz(Bar.java:1)",
+            "2026-09-07 15:20:43. INFO c.j.b.Foo -小数点后没数字",
+            "2026-09-07 15:20:43.1234567890 INFO c.j.b.Foo -小数十位",
+            "2026-09-07 15:20:43INFO c.j.b.Foo -时间后没空白",
+            "2026-09-07 15:20:43 info c.j.b.Foo -小写级别",
+            "2026-09-07 15:20:43 INFOx c.j.b.Foo -级别后粘着小写",
+            "2026-09-07 15:20:43 INFO",
+            "2026-09-07 15:20:43 [t] INFO",
+            "2026/09/07 15:20:43 INFO c.j.b.Foo -日期分隔符不对",
+            "",
+        ];
+        let fields = |event: Option<LogEvent>| {
+            event.map(|e| {
+                (
+                    e.timestamp,
+                    e.level,
+                    e.trace_id,
+                    e.span_id,
+                    e.thread,
+                    e.logger,
+                    e.message,
+                )
+            })
+        };
+        for line in lines {
+            assert_eq!(
+                fields(hand.parse(line)),
+                fields(regex.parse(line)),
+                "行: {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -604,6 +1057,163 @@ mod tests {
             .expect("应当匹配");
         assert_eq!(event.level, "ERROR");
         assert_eq!(event.message, "出事了");
+    }
+
+    const GIN_LINE: &str = r#"[GIN] 2026/09/07 - 10:07:01 | 200 |      40.601µs |    172.16.250.3 | POST     "/extra_text""#;
+    const NGINX_LINE: &str = r#"127.0.0.6 - - [07/Sep/2026:18:06:53 +0800] "GET / HTTP/1.1" 200 601 "-" "kube-probe/1.28+" "-""#;
+
+    #[test]
+    fn parses_gin_access_log() {
+        let event = GinParser.parse(GIN_LINE).expect("应当匹配");
+        // 时间是日志自己的，不是采集时刻
+        assert_eq!(
+            event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-09-07 10:07:01"
+        );
+        assert_eq!(event.logger, "gin");
+        assert_eq!(event.level, "INFO");
+        // 整行原样留着，不抽字段
+        assert_eq!(event.message, GIN_LINE);
+        assert!(event.fields.is_empty());
+    }
+
+    #[test]
+    fn parses_gin_variants() {
+        // 新版本 gin 的路径不带引号；5xx 折算成 ERROR
+        let event = GinParser
+            .parse(
+                "[GIN] 2026/09/07 - 10:07:01 | 502 |     1.5ms |     10.0.0.1 | GET      /healthz",
+            )
+            .expect("应当匹配");
+        assert_eq!(event.level, "ERROR");
+
+        // 4xx 折算成 WARN，路径里带 `|` 也不影响
+        let event = GinParser
+            .parse(r#"[GIN] 2026/09/07 - 10:07:01 | 404 | 1ms | 10.0.0.1 | GET      "/a|b""#)
+            .expect("应当匹配");
+        assert_eq!(event.level, "WARN");
+
+        // 启动时的路由表不是 access log
+        assert!(GinParser
+            .parse("[GIN-debug] POST   /extra_text  --> main.handler (3 handlers)")
+            .is_none());
+        // 彩色输出解析不出来，交给兜底
+        assert!(GinParser
+            .parse(
+                "[GIN] 2026/09/07 - 10:07:01 |\u{1b}[97;42m 200 \u{1b}[0m| 1ms | 10.0.0.1 | GET /"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn parses_nginx_combined_log() {
+        let event = NginxParser.parse(NGINX_LINE).expect("应当匹配");
+        assert_eq!(event.logger, "nginx");
+        assert_eq!(event.level, "INFO");
+        assert_eq!(event.message, NGINX_LINE);
+        assert!(event.fields.is_empty());
+
+        // +0800 的日志在 +0800 的机器上时间不变
+        let want = chrono::FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 9, 7, 18, 6, 53)
+            .unwrap()
+            .with_timezone(&Local)
+            .naive_local();
+        assert_eq!(event.timestamp, want);
+    }
+
+    #[test]
+    fn parses_nginx_variants() {
+        // body_bytes_sent 为 `-`、remote_user 非空、请求行里带查询串
+        let event = NginxParser
+            .parse(r#"10.1.2.3 - admin [07/Sep/2026:18:06:53 +0000] "POST /api/v1/order?id=1 HTTP/2.0" 500 - "https://example.com/x" "curl/8.4.0""#)
+            .expect("应当匹配");
+        assert_eq!(event.level, "ERROR");
+
+        // 不带时区偏移的 CLF
+        let event = NginxParser
+            .parse(r#"10.1.2.3 - - [07/Sep/2026:18:06:53] "GET / HTTP/1.1" 304 0 "-" "-""#)
+            .expect("应当匹配");
+        assert_eq!(
+            event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-09-07 18:06:53"
+        );
+
+        // Java 日志里带方括号的正文不能被误判成 nginx
+        assert!(NginxParser
+            .parse(
+                "2026-09-07 15:20:43,633 [main] INFO c.a.Foo -handler [public void foo()] 200 ok"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn chain_tries_formats_in_order() {
+        let parser = ChainParser::from_formats(
+            &[LogFormat::Logback, LogFormat::Gin, LogFormat::Nginx],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parser.parse(LINE).unwrap().logger,
+            "c.a.c.service.DelayTaskService"
+        );
+        assert_eq!(parser.parse(GIN_LINE).unwrap().logger, "gin");
+        assert_eq!(parser.parse(NGINX_LINE).unwrap().logger, "nginx");
+        // 都不匹配还是 None，走 Aggregator 的续行/兜底
+        assert!(parser.parse("\tat com.foo.Bar.baz(Bar.java:42)").is_none());
+    }
+
+    #[test]
+    fn access_log_no_longer_glues_onto_previous_event() {
+        // 配全格式之前：gin 行被当成上一条的堆栈粘上去
+        let mut agg = Aggregator::new(Arc::new(RegexParser::new()));
+        assert!(agg.push(LINE).is_none());
+        assert!(agg.push(GIN_LINE).is_none());
+        assert!(
+            agg.flush().unwrap().message.contains("[GIN]"),
+            "旧行为：粘连"
+        );
+
+        // 配全之后：各自成条
+        let parser =
+            ChainParser::from_formats(&[LogFormat::Logback, LogFormat::Gin], None).unwrap();
+        let mut agg = Aggregator::new(Arc::new(parser));
+        assert!(agg.push(LINE).is_none());
+        let java = agg.push(GIN_LINE).expect("gin 行到来时 Java 那条应当闭合");
+        assert_eq!(java.logger, "c.a.c.service.DelayTaskService");
+        assert!(!java.message.contains("[GIN]"));
+
+        // gin 自己的 ErrorMessage 是紧跟在后面的一行，仍然要并进这条 access log
+        assert!(agg.push("Error #01: broken pipe").is_none());
+        let access = agg.flush().expect("应当有一条");
+        assert_eq!(access.logger, "gin");
+        assert!(access.message.ends_with("Error #01: broken pipe"));
+    }
+
+    #[test]
+    fn access_log_timestamps_reject_garbage() {
+        for bad in [
+            "",
+            "2026/09/07 10:07:01",   // 少了 ` - `
+            "2026-09-07 - 10:07:01", // 日期分隔符不对
+            "2026/09/07 - 10:07:0",  // 长度不够
+            "2026/13/07 - 10:07:01", // 月份越界
+        ] {
+            assert!(parse_gin_timestamp(bad).is_none(), "不应解析 {bad:?}");
+        }
+        for bad in [
+            "",
+            "07/Sep/2026 18:06:53",       // 少了冒号
+            "07/Sept/2026:18:06:53",      // 月份缩写不对
+            "07/Sep/2026:18:06:53 0800",  // 缺正负号
+            "07/Sep/2026:18:06:53 +08",   // 偏移长度不对
+            "32/Sep/2026:18:06:53 +0800", // 日期越界
+        ] {
+            assert!(parse_clf_timestamp(bad).is_none(), "不应解析 {bad:?}");
+        }
     }
 
     #[test]

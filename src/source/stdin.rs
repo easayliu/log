@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::Result;
 use crate::event::LogEvent;
-use crate::parser::{Aggregator, Parser, RegexParser};
+use crate::parser::{Aggregator, LogbackParser, Parser};
 use crate::shutdown::Shutdown;
 use crate::source::{Source, SourceSender};
 
@@ -23,7 +23,7 @@ pub struct StdinSource {
 impl StdinSource {
     pub fn new() -> Self {
         Self {
-            parser: Arc::new(RegexParser::new()),
+            parser: Arc::new(LogbackParser),
             host: Arc::from(super::file::hostname()),
             file: Arc::from("stdin"),
             batch_lines: 500,

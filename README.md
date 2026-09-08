@@ -40,9 +40,48 @@
 * **异常堆栈会自动合并**到上一条日志的 `message`，不会被拆成一堆碎片；
 * 格式不同的项目可以换正则：`RegexParser::with_pattern(...)`，命名捕获组用
   `timestamp` `level` `trace_id` `span_id` `thread` `logger` `message`；
+* 一个节点上不止一种格式时用 `parser.formats` 列全（见下面「access log」）；
 * 时间戳**存的就是日志里的本地时间**：日志写 `11:04:08.914`，库里查出来还是 `11:04:08.914`，
   中间不做任何时区换算。想让列自带时区标注可以把 DDL 改成 `DateTime64(3, 'Asia/Shanghai')`；
   解析不出时间的行（比如没有时间戳的裸行）用采集时刻的本地时间兜底。
+
+### access log
+
+整机采集时节点上通常不只有 Java 日志。`parser.formats` 按顺序列出会遇到的格式，
+每行按顺序试，第一个匹配上的胜出：
+
+```yaml
+parser:
+  formats: [logback, gin, nginx]   # 默认只有 logback
+```
+
+| 格式 | 样例 |
+| --- | --- |
+| `gin` | `[GIN] 2026/09/07 - 10:07:01 \| 200 \|      40.601µs \|    172.16.250.3 \| POST     "/extra_text"` |
+| `nginx` | `127.0.0.6 - - [07/Sep/2026:18:06:53 +0800] "GET / HTTP/1.1" 200 601 "-" "kube-probe/1.28+" "-"` |
+
+这三种格式共用同一张表、同一套列，**配了新格式不用 ALTER**：
+
+| 字段 | access log 里是什么 |
+| --- | --- |
+| `timestamp` | 日志自己的时间戳（不配的话这里是采集时刻，行序会错） |
+| `level` | 由状态码折算：5xx = `ERROR`，4xx = `WARN`，其余 `INFO`，好让按 level 过滤/告警照样生效 |
+| `logger` | `gin` / `nginx`，用来把 access log 和业务日志分开查 |
+| `message` | 整行原文 |
+
+所以「找出错的请求」是 `where logger = 'gin' and level = 'ERROR'`。
+不把 `status` / `path` / `latency` 抽成独立列是有意的：这张表混着业务日志，为少数行
+加一堆稀疏列，换来的只是「拿日志表做访问分析」这一个场景，而那个场景本来就该单独
+建表。要精确到 path 就从 `message` 里抠。
+
+时间用日志自己的时间戳：gin 打的是服务本地时间，原样取；nginx CLF 带 `+0800`
+这类偏移，按 CRI 拆壳同样的口径换成本机墙上时间。
+
+两个已知不覆盖的：`gin.ForceConsoleColor()` 的彩色输出（状态码被 ANSI 转义包着）、
+启动时的 `[GIN-debug]` 路由表 —— 都当解析不出，整行进 `message`。
+
+> **漏配一种格式不会报错**，只会被当成上一条日志的堆栈续行粘到 `message` 尾巴上
+> （这正是异常堆栈能自动合并的同一套机制）。发现日志串行了，先看 `formats` 配全了没有。
 
 ## 启动
 
@@ -269,7 +308,7 @@ source:
 
 程序做的事：
 
-* 剥掉运行时外壳，把里面的应用日志交给那套 logback 正则；
+* 剥掉运行时外壳，把里面的应用日志交给 logback 解析器；
 * 被切成 `P` 片段的超长行**先拼回整行**再解析；
 * 从路径解出 `namespace` / `pod` / `container`，连同 `stream`（stdout/stderr）写进去 ——
   **不访问 API server**，所以不需要 ServiceAccount / RBAC；

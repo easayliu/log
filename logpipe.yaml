@@ -22,7 +22,14 @@ source:
   # host: 覆盖主机名，默认取本机 hostname
 
 parser:
-  # 默认就是我们的 logback 格式，需要改格式时才填 pattern，
+  # 这条 pipeline 上会遇到的日志格式，按顺序试，第一个匹配上的胜出。
+  # 可选 logback（默认）/ gin / nginx。整机采集时按节点上实际跑的语言栈配全：
+  #   formats: [logback, gin, nginx]
+  # 漏配的那种格式不会报错，只会被当成上一条日志的堆栈续行粘上去。
+  # access log 的状态码折算成 level（5xx=ERROR / 4xx=WARN），logger 记成
+  # gin / nginx，整行原文留在 message 里 —— 表结构不变，加格式不用 ALTER。
+  formats: [logback]
+  # logback 那一档的自定义正则，需要改格式时才填，
   # 命名捕获组：timestamp / level / trace_id / span_id / thread / logger / message
   # pattern: '^(?P<timestamp>\S+ \S+)\s+\[(?P<thread>[^\]]*)\]\s+(?P<level>[A-Z]+)\s+(?P<logger>\S+)\s*-?\s?(?P<message>.*)$'
   # 时间戳原样落库（日志写 11:04 库里就是 11:04），不做时区换算

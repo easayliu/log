@@ -1,6 +1,6 @@
 [package]
 name = "logpipe"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Minimal log collection & ingestion framework: source -> batch -> sink"
 license = "MIT"
@@ -15,6 +15,8 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
 regex = "1"
+# 行切分找换行符用，regex 本来就依赖它，不多一个 crate
+memchr = "2"
 hostname = "0.4"
 thiserror = "2"
 serde_yaml_ng = "0.10"

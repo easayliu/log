@@ -10,8 +10,7 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::batch::{BatchConfig, RetryConfig};
 use crate::error::{Error, Result};
-use crate::event::LogEvent;
-use crate::parser::{ContainerFormat, RegexParser};
+use crate::parser::{ChainParser, ContainerFormat, LogFormat};
 use crate::pipeline::{OnError, Pipeline};
 use crate::sink::console::Encoding;
 use crate::sink::{ClickhouseSink, ConsoleSink};
@@ -115,7 +114,16 @@ pub struct FileSourceConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParserConfig {
+    /// 这条 pipeline 上会遇到的日志格式，按顺序尝试，第一个匹配上的胜出。
+    /// 可选 `logback`（默认）/ `gin` / `nginx`。
+    ///
+    /// 整机采集（`type: kubernetes`）时按节点上实际跑的语言栈配全，比如
+    /// `[logback, gin, nginx]`。**漏配的那种格式不会报错**，只会被当成上一条日志的
+    /// 堆栈续行粘上去。
+    #[serde(default)]
+    pub formats: Vec<LogFormat>,
     /// 自定义正则，命名捕获组：timestamp / level / trace_id / span_id / thread / logger / message。
+    /// 只作用在 `logback` 这一档上。
     pub pattern: Option<String>,
 }
 
@@ -410,11 +418,23 @@ impl Config {
         Ok(sink)
     }
 
-    fn build_parser(&self) -> Result<RegexParser> {
-        match &self.parser.pattern {
-            Some(pattern) => RegexParser::with_pattern(pattern),
-            None => Ok(RegexParser::new()),
+    /// 实际生效的格式列表。配置留空就是默认的 logback 一种。
+    fn formats(&self) -> Vec<LogFormat> {
+        if self.parser.formats.is_empty() {
+            vec![LogFormat::Logback]
+        } else {
+            self.parser.formats.clone()
         }
+    }
+
+    fn build_parser(&self) -> Result<ChainParser> {
+        let formats = self.formats();
+        if self.parser.pattern.is_some() && !formats.contains(&LogFormat::Logback) {
+            return Err(Error::config(
+                "parser.pattern 是给 logback 格式用的，formats 里没有 logback 时它不会生效",
+            ));
+        }
+        ChainParser::from_formats(&formats, self.parser.pattern.as_deref())
     }
 
     fn build_source(&self) -> Result<FileSource> {
@@ -444,7 +464,7 @@ impl Config {
                 if let Some(host) = &k8s.host {
                     source = source.host(host);
                 }
-                source
+                source.fields(self.fields.clone())
             }
             SourceConfig::File(file) => {
                 if file.include.is_empty() {
@@ -463,7 +483,7 @@ impl Config {
                 if let Some(host) = &file.host {
                     source = source.host(host);
                 }
-                source
+                source.fields(self.fields.clone())
             }
         };
 
@@ -497,7 +517,7 @@ impl Config {
     pub fn build(self) -> Result<Pipeline> {
         let source = self.build_source()?;
 
-        let mut builder = Pipeline::builder()
+        let builder = Pipeline::builder()
             .source(source)
             .batch(
                 BatchConfig::default()
@@ -516,16 +536,6 @@ impl Config {
                 OnErrorSetting::Stop => OnError::Stop,
                 OnErrorSetting::Drop => OnError::Drop,
             });
-
-        if !self.fields.is_empty() {
-            let fields = self.fields.clone();
-            builder = builder.transform(move |mut event: LogEvent| {
-                for (key, value) in &fields {
-                    event.insert(key.clone(), value.clone());
-                }
-                Some(event)
-            });
-        }
 
         Ok(match &self.sink {
             SinkConfig::Clickhouse { .. } => builder.sink(self.build_clickhouse()?).build()?,
@@ -688,6 +698,73 @@ sink:
         assert!(single.contains("ENGINE = MergeTree"), "{single}");
         assert!(!single.contains("ON CLUSTER"), "{single}");
         assert!(!single.contains("app_log_local"), "{single}");
+    }
+
+    #[test]
+    fn access_log_formats_do_not_change_the_schema() {
+        let config = Config::parse(
+            r#"
+source:
+  type: kubernetes
+parser:
+  formats: [logback, gin, nginx]
+sink:
+  type: clickhouse
+  endpoint: http://clickhouse:8123
+  database: logs
+  table: app_log
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.formats(),
+            [LogFormat::Logback, LogFormat::Gin, LogFormat::Nginx]
+        );
+
+        // access log 走 level / logger / message 这几个现成的列，
+        // 配了新格式不该要求线上表 ALTER
+        let ddl = config.ddl().unwrap();
+        for column in ["`status`", "`path`", "`latency_us`", "`user_agent`"] {
+            assert!(!ddl.contains(column), "多出了 {column}:\n{ddl}");
+        }
+        config.build().unwrap();
+    }
+
+    #[test]
+    fn rejects_pattern_without_logback_format() {
+        let err = Config::parse(
+            r#"
+source:
+  type: kubernetes
+parser:
+  formats: [gin]
+  pattern: '^(?P<timestamp>\S+ \S+) (?P<level>[A-Z]+) (?P<message>.*)$'
+sink:
+  type: console
+"#,
+        )
+        .unwrap()
+        .check()
+        .expect_err("pattern 配了却不生效应当报错");
+        assert!(err.to_string().contains("logback"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_format() {
+        let err = Config::parse(
+            r#"
+source:
+  type: kubernetes
+parser:
+  formats: [log4j]
+sink:
+  type: console
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`parser` 配置有问题"), "{err}");
     }
 
     #[test]
