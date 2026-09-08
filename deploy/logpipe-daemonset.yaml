@@ -49,6 +49,9 @@ data:
       # ClickHouse 集群名。填了就写 Distributed 表、DDL 带 ON CLUSTER；
       # 改了这里要同步改 logpipe-ddl-job.yaml 的 CH_CLUSTER
       # cluster: bj_ck
+      # 日志时间戳的时区，--ddl 把 timestamp 列建成带时区的 DateTime64。
+      # 接 Jaeger / Grafana 必填，不然 span 按 UTC 开窗口查日志会差 8 小时
+      timezone: Asia/Shanghai
       user: default
       password: ""
       timeout_secs: 30
@@ -91,7 +94,7 @@ spec:
       containers:
         - name: logpipe
           # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
-          image: ghcr.io/easayliu/log:v0.1.4
+          image: ghcr.io/easayliu/log:v0.1.7
           args: ["/etc/logpipe/logpipe.yaml"]
           env:
             - name: RUST_LOG

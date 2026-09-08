@@ -1,6 +1,6 @@
 [package]
 name = "logpipe"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Minimal log collection & ingestion framework: source -> batch -> sink"
 license = "MIT"
@@ -13,6 +13,8 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# sink.timezone：把 IANA 时区名换算成偏移，写 INSERT 时给时间戳带上 +08:00
+chrono-tz = "0.10"
 glob = "0.3"
 regex = "1"
 # 行切分找换行符用，regex 本来就依赖它，不多一个 crate

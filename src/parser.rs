@@ -213,6 +213,56 @@ fn digits(bytes: &[u8]) -> Option<u32> {
 /// 格式是定长的 `YYYY-MM-DD[ T]HH:MM:SS`，后面跟可选的小数秒（logback 的 ISO8601
 /// 用逗号分隔，所以 `.` 和 `,` 都收）。这里手写扫描而不是用 chrono 的
 /// `parse_from_str` 挨个试格式：实测 158ns -> 8ns，而这是每条日志都要走的路径。
+/// 把日志里的 trace id 整理成 Jaeger / OTel 认的写法。
+///
+/// 日志和 trace 的联动靠这一列**精确相等**：Grafana 从 span 跳日志是
+/// `where trace_id = '<span 的 traceId>'`，从日志跳 Jaeger 是拿原值拼 URL。
+/// 所以入库前把写法统一掉，而不是留给查询时 `lower()`：
+///
+/// * 全是 hex 的转小写 —— W3C `traceparent` 规定小写，Java agent 也都这么打，
+///   但 `.NET`/自定义 MDC 有大写的；
+/// * 16 位 hex（64 位老格式）左补零到 32 位 —— Jaeger 存储里就是这么存的，
+///   两边不统一等值查询就对不上；
+/// * SkyWalking 没有 trace 上下文时打的 `N/A` 置空，别让字面量进库；
+/// * 其他写法原样保留：不是我们认得的格式，但丢了信息更糟。
+///
+/// 热路径上跑，正常的 32 位小写 hex 只做一次分配，和原来 `to_owned` 一样。
+fn normalize_trace_id(raw: &str) -> String {
+    normalize_id(raw, 32)
+}
+
+/// 同 [`normalize_trace_id`]，span id 是 64 位，16 位 hex。
+fn normalize_span_id(raw: &str) -> String {
+    normalize_id(raw, 16)
+}
+
+fn normalize_id(raw: &str, width: usize) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("N/A") {
+        return String::new();
+    }
+    let bytes = raw.as_bytes();
+    if !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return raw.to_owned();
+    }
+    // 只有 16 位的 trace id 才补零；span id 传进来 width 就是 16，等长不补。
+    let pad = if bytes.len() == 16 && width == 32 {
+        16
+    } else {
+        0
+    };
+    let mut out = String::with_capacity(pad + bytes.len());
+    for _ in 0..pad {
+        out.push('0');
+    }
+    if bytes.iter().any(u8::is_ascii_uppercase) {
+        out.extend(raw.chars().map(|c| c.to_ascii_lowercase()));
+    } else {
+        out.push_str(raw);
+    }
+    out
+}
+
 fn parse_timestamp(raw: &str) -> Option<NaiveDateTime> {
     let bytes = raw.as_bytes();
     if bytes.len() < 19
@@ -286,11 +336,12 @@ impl Parser for RegexParser {
             line[head_end..].to_owned()
         };
 
+        let raw = |name: &str| caps.name(name).map_or("", |m| m.as_str());
         Some(LogEvent {
             timestamp,
             level: group("level"),
-            trace_id: group("trace_id"),
-            span_id: group("span_id"),
+            trace_id: normalize_trace_id(raw("trace_id")),
+            span_id: normalize_span_id(raw("span_id")),
             thread: group("thread"),
             logger: group("logger"),
             message,
@@ -455,8 +506,8 @@ impl Parser for LogbackParser {
             timestamp: parse_timestamp(head.timestamp)
                 .unwrap_or_else(|| Local::now().naive_local()),
             level: head.level.trim().to_owned(),
-            trace_id: head.trace_id.trim().to_owned(),
-            span_id: head.span_id.trim().to_owned(),
+            trace_id: normalize_trace_id(head.trace_id),
+            span_id: normalize_span_id(head.span_id),
             thread: head.thread.trim().to_owned(),
             logger: head.logger.trim().to_owned(),
             message: head.message.to_owned(),
@@ -885,6 +936,39 @@ mod tests {
         assert_eq!(event.thread, "main");
         assert!(event.trace_id.is_empty());
         assert_eq!(event.message, "启动慢");
+    }
+
+    #[test]
+    fn normalizes_trace_ids_for_jaeger() {
+        // 大写转小写、64 位补零、N/A 置空 —— 两个解析器口径一致
+        for parser in [
+            Box::new(RegexParser::new()) as Box<dyn Parser>,
+            Box::new(LogbackParser),
+        ] {
+            let event = parser
+                .parse("2026-09-07 11:04:08.914 [TID:E89A476882236CE0F1186D1522C8F59F] [SpanID:E8B0E73E2132F21C] [main] INFO c.a.Foo -x")
+                .expect("应当匹配");
+            assert_eq!(event.trace_id, "e89a476882236ce0f1186d1522c8f59f");
+            assert_eq!(event.span_id, "e8b0e73e2132f21c");
+
+            let event = parser
+                .parse("2026-09-07 11:04:08.914 [TID:e8b0e73e2132f21c] [SpanID:e8b0e73e2132f21c] [main] INFO c.a.Foo -x")
+                .expect("应当匹配");
+            assert_eq!(event.trace_id, "0000000000000000e8b0e73e2132f21c");
+            assert_eq!(event.span_id, "e8b0e73e2132f21c", "span id 不补零");
+
+            let event = parser
+                .parse("2026-09-07 11:04:08.914 [TID:N/A] [main] INFO c.a.Foo -x")
+                .expect("应当匹配");
+            assert!(event.trace_id.is_empty(), "{:?}", event.trace_id);
+            assert_eq!(event.thread, "main");
+
+            // 认不出的格式原样保留（比如 SkyWalking 带点号的 id）
+            let event = parser
+                .parse("2026-09-07 11:04:08.914 [TID:a1b2c3d4e5f6.53.17257470000000001] [main] INFO c.a.Foo -x")
+                .expect("应当匹配");
+            assert_eq!(event.trace_id, "a1b2c3d4e5f6.53.17257470000000001");
+        }
     }
 
     #[test]

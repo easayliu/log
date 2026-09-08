@@ -35,6 +35,9 @@
 | `file` / `host` | 采集时自动补上 |
 
 * `[TID:...]`、`[SpanID:...]`、`[thread]` 都是可选的，缺失时为空串；
+* `trace_id` / `span_id` 入库前按 W3C / Jaeger 的口径整理：hex 转小写、16 位的 trace id
+  左补零到 32 位、SkyWalking 无上下文时打的 `N/A` 置空；认不出的写法原样保留。
+  这样和 Jaeger 里的 id **精确相等**，联动才查得到（见「接 Jaeger」）；
 * 毫秒用逗号（logback `ISO8601` 默认的 `15:20:43,633`）和用小数点都认，落库都是毫秒；
 * 级别带方括号也认，比如 `2026-09-07 15:20:43,633 [DEBUG] o.s.w.s.m.m.a.RequestMappingHandlerMapping Returning handler method [...]`；
 * **异常堆栈会自动合并**到上一条日志的 `message`，不会被拆成一堆碎片；
@@ -42,7 +45,9 @@
   `timestamp` `level` `trace_id` `span_id` `thread` `logger` `message`；
 * 一个节点上不止一种格式时用 `parser.formats` 列全（见下面「access log」）；
 * 时间戳**存的就是日志里的本地时间**：日志写 `11:04:08.914`，库里查出来还是 `11:04:08.914`，
-  中间不做任何时区换算。想让列自带时区标注可以把 DDL 改成 `DateTime64(3, 'Asia/Shanghai')`；
+  中间不做任何时区换算。配了 `sink.timezone: Asia/Shanghai` 的话 `--ddl` 会把列建成
+  `DateTime64(3, 'Asia/Shanghai')`，存的值不变，只是让 ClickHouse 知道这是哪个时区的墙上
+  时间（和 Jaeger / Grafana 按绝对时间联动时必须配）；
   解析不出时间的行（比如没有时间戳的裸行）用采集时刻的本地时间兜底。
 
 ### access log
@@ -169,9 +174,10 @@ async fn main() -> logpipe::Result<()> {
 ## 表结构
 
 字段由程序定义（上面那 9 个，外加容器元数据列和 `fields` 里的静态字段），
-**建表由你自己执行**，程序不会自动建表也不会 `ALTER` ——
+**建表由你自己执行**，采集进程不执行任何 DDL ——
 分区键、排序键、TTL、引擎这些线上细节留在你手里。启动时只做校验：`require_healthy: true`
-的情况下会 `SELECT 1` + `EXISTS TABLE`，表不存在就直接报错退出，不会白读一段日志。
+的情况下会 `SELECT 1` + `EXISTS TABLE` + 对一遍 `system.columns`，表不存在或者
+**缺列就直接报错退出**，报错里写清缺哪几列、怎么补，不会白读一段日志。
 
 ```bash
 cargo run -- --ddl logpipe.yaml | clickhouse-client
@@ -188,25 +194,43 @@ CREATE TABLE IF NOT EXISTS `logs`.`app_log`
     `logger`    String,
     `message`   String,
     `file`      String,
-    `host`      LowCardinality(String)
+    `host`      LowCardinality(String),
+    INDEX `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(`timestamp`)
 ORDER BY (`timestamp`, `level`, `trace_id`)
 TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
+
+ALTER TABLE `logs`.`app_log`
+    ADD COLUMN IF NOT EXISTS `level` LowCardinality(String),
+    ADD COLUMN IF NOT EXISTS `trace_id` String,
+    ...
+    ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4;
 ```
 
-改分区/TTL/排序键直接改这份 SQL 就行，程序不关心。要注意三点：
+两段：`CREATE TABLE IF NOT EXISTS` 管新表，后面的 `ALTER TABLE` 管老表 —— 全是
+`IF NOT EXISTS` 这类幂等操作，新表上跑是空转，老表上跑就把差异补齐。所以**表结构变了
+重跑一遍就行**，不用人手对着表写 ALTER。
+
+改分区/TTL/排序键直接改这份 SQL 就行，程序不关心。要注意几点：
 
 * 配置里 `fields` 加的静态字段（`cluster`、`env`……）**`--ddl` 会自动带上对应的列**，
   类型按值推断：字符串 → `LowCardinality(String)`、整数 → `Int64`、小数 → `Float64`、
   布尔 → `UInt8`。采容器日志时（`type: kubernetes`）`stream` / `namespace` / `pod` /
   `container` 四列同样自动带上。
-* **但已经建好的表不会自动改。**给线上配置新加一个 `fields` 之后，要自己
-  `ALTER TABLE ... ADD COLUMN`（或者重跑 `--ddl` 对照着补）。插入时带了
-  `input_format_skip_unknown_fields=1`，表里没这列**不会报错、整批也不会失败，
-  这个字段会被静默丢掉** —— 加了字段却查不到值，先去看表结构。
+* **给线上配置新加了 `fields`，重跑一次 `--ddl` 的输出（ddl Job）。**忘了也不会
+  丢数据以外的东西：插入带着 `input_format_skip_unknown_fields=1`，表里没这列不报错、
+  整批也不失败，只是那个字段被丢掉；但采集进程启动时会对一遍列，缺了直接报错退出，
+  报错里点名缺哪几列。
+* ALTER 段不碰的：排序键、分区键本来就改不了；TTL 能改但 `MODIFY TTL` 会触发重算；
+  已有列**类型**变了（比如 `replica` 从整数改成字符串）`IF NOT EXISTS` 会跳过 ——
+  这几种本来就该人看一眼再动。
 * 列名必须和字段名一致，多余的列（有默认值或 Nullable）不影响插入。
+* `idx_trace_id` 是给「拿一个 trace id 反查全部日志」用的：这种查询往往不带时间范围，
+  排序键里 `trace_id` 排在 `timestamp` 后面帮不上忙，没索引就是全表扫。`ADD INDEX`
+  只管之后写入的 part，历史数据要 `ALTER TABLE ... MATERIALIZE INDEX idx_trace_id`
+  才有（重算一遍，挑低峰跑）。不需要就删掉。
 
 ### 接 ClickHouse 集群
 
@@ -251,9 +275,10 @@ ENGINE = Distributed(`bj_ck`, `logs`, `app_log_local`, rand());
 * 分片键是 `rand()`，分布最均匀。想让同一台机器的日志落同一个分片
   （压缩率更好、按 host 查不用跨分片）改成 `cityHash64(host)`。
 * 建库也要 `ON CLUSTER`，否则只在被连上的那个节点建出来，别的节点建本地表时会报库不存在。
-* 加 `fields` 之后补列要**补两张表**，本地表在前：
-  `ALTER TABLE logs.app_log_local ON CLUSTER bj_ck ADD COLUMN ...`，
-  再对 `logs.app_log` 来一遍 —— Distributed 表的结构是建表时拷过去的，不会跟着变。
+* 补列要**补两张表**，Distributed 表的结构是建表时拷过去的，不会跟着本地表变。
+  `--ddl` 输出的 ALTER 段已经是两张表各一条、都带 `ON CLUSTER`、本地表在前（反过来的话
+  中间那一瞬间往 Distributed 表插新列会因为本地表还没有而失败）；跳数索引只加在本地表，
+  Distributed 不支持。
 
 还差的是**多入口**：`endpoint` 只能填一个地址（`src/config.rs`），没有多节点轮询和
 故障转移 —— 节点挂了只会按 retry 策略重试同一个地址，重试耗尽后按 `on_error` 停机或丢。
@@ -265,6 +290,49 @@ ENGINE = Distributed(`bj_ck`, `logs`, `app_log_local`, rand());
 cargo run --example tail_to_console -- '/var/log/app/*.log'
 cargo run --example tail_to_clickhouse -- '/var/log/app/*.log'
 ```
+
+### 接 Jaeger
+
+Jaeger 只存 trace 不收日志，所以「接入」在日志这边只有一件事：**日志和 trace 通过
+`trace_id` 互相跳**。logpipe 不用改数据模型、也不需要 OTLP，要保证的是两个「相等」：
+
+1. **id 相等**。打日志的 MDC 和往 Jaeger 上报的必须是同一个 agent（OTel Java agent
+   同时干这两件事）。解析器会把 id 整理成 Jaeger 存的样子（小写、32 位），所以
+   `where trace_id = '<Jaeger 里的 traceID>'` 直接成立。
+2. **时间相等**。Grafana 从 span 跳日志是按 span 的 **UTC** 时间前后开窗口去查。我们
+   存的是墙上时间，列不标时区的话 ClickHouse 按服务端时区理解 —— 服务端 UTC、日志北京
+   时间就差 8 小时，跳过去一条也看不到。所以要配：
+
+```yaml
+sink:
+  type: clickhouse
+  timezone: Asia/Shanghai   # 日志时间戳所在的时区
+```
+
+配了之后做两件事：INSERT 的时间戳带上偏移（`2026-09-07 11:04:08.914+08:00`），
+存进去的绝对时刻不再依赖表结构，老表还没改也不会存错；`--ddl` 把列建成
+`DateTime64(3, 'Asia/Shanghai')`，查出来显示的还是 `11:04:08.914`。已经建好的表
+重跑一次 `--ddl` 的输出即可，ALTER 段里带着 `MODIFY COLUMN timestamp`，改时区是纯
+元数据操作不重写数据（`timestamp` 在排序键里，ClickHouse 对排序键列只放行这类元数据
+兼容的变更，第一次在你们的版本上跑先在测试库验一下）。
+
+Grafana 两个方向各接一次：
+
+* **日志 → Jaeger**：ClickHouse 数据源 → Logs 配置 → trace id 列填 `trace_id`，
+  再加一条 data link 指向 Jaeger 数据源，query 填 `${__value.raw}`。
+* **Jaeger → 日志**：Jaeger 数据源 → Trace to logs → 选 ClickHouse 数据源、勾 custom
+  query，查询写 `trace_id = '${__span.traceId}'`，时间偏移各留一两分钟兜异步日志。
+
+不走 Grafana 的话，拿到 trace id 直接查：
+
+```sql
+select timestamp, level, logger, message
+from logs.app_log
+where trace_id = 'e89a476882236ce0f1186d1522c8f59f'
+order by timestamp
+```
+
+不带时间范围也不慢，`idx_trace_id` 会把没这个 id 的 granule 跳掉。
 
 ## 投递语义
 
@@ -340,16 +408,16 @@ kubectl -n logging rollout restart daemonset/logpipe
 Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USER` /
 `CH_PASSWORD` 要和 ConfigMap 里 sink 的 `endpoint` / `database` / `cluster` / `user` /
 `password` 对上（接集群见上面「接 ClickHouse 集群」，`CH_CLUSTER` 留空就是单机）。DDL 是
-`CREATE TABLE IF NOT EXISTS`，重复跑无副作用，可以挂成 CI / helm 的 pre-install hook。
-**但已存在的表它不会改**：加了 `fields` 之后新列要自己 `ALTER TABLE ... ADD COLUMN`，
-详见上面「表结构」那节。
+`CREATE TABLE IF NOT EXISTS` 加一段幂等的 `ALTER TABLE ... IF NOT EXISTS`，重复跑无副作用，
+可以挂成 CI / helm 的 pre-install hook；**改了配置里的 `fields` 或 `timezone` 就重跑一次**，
+老表的列会补齐，详见上面「表结构」那节。
 
 不想在集群里跑 Job 的话，`--ddl` 不连库，本地也能渲染出来：
 
 ```bash
 kubectl -n logging get cm logpipe-config -o jsonpath='{.data.logpipe\.yaml}' > /tmp/logpipe.yaml
 docker run --rm -v /tmp/logpipe.yaml:/etc/logpipe/logpipe.yaml:ro \
-  ghcr.io/easayliu/log:v0.1.4 --ddl /etc/logpipe/logpipe.yaml
+  ghcr.io/easayliu/log:v0.1.7 --ddl /etc/logpipe/logpipe.yaml
 ```
 
 要点：容器日志文件是 root `0600`，所以 `runAsUser: 0`；位点目录挂 hostPath 才能在 Pod

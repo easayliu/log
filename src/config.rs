@@ -139,6 +139,11 @@ pub enum SinkConfig {
         /// 叫 cluster 的静态字段无关）。配了之后 `--ddl` 生成 `ReplicatedMergeTree`
         /// 本地表 + `Distributed` 表，两条都带 `ON CLUSTER`。
         cluster: Option<String>,
+        /// 日志时间戳的时区（IANA 名，如 `Asia/Shanghai`）。配了之后 INSERT 的时间戳
+        /// 带偏移（`+08:00`），`--ddl` 把 `timestamp` 列建成带时区的 `DateTime64`；
+        /// 不填就是裸 `DateTime64(3)`，按服务端时区理解。要和 Jaeger / Grafana 按
+        /// 绝对时间联动的话必须填，见 README「接 Jaeger」。
+        timezone: Option<String>,
         user: Option<String>,
         password: Option<String>,
         #[serde(default)]
@@ -361,9 +366,7 @@ impl Config {
     /// ClickHouse sink 对应的建表语句，会带上容器元数据列和 `fields` 里的静态字段列。
     pub fn ddl(&self) -> Result<String> {
         match &self.sink {
-            SinkConfig::Clickhouse { .. } => Ok(self
-                .build_clickhouse()?
-                .create_table_ddl_with(&self.extra_columns())),
+            SinkConfig::Clickhouse { .. } => Ok(self.build_clickhouse()?.create_table_ddl()),
             SinkConfig::Console { .. } => Err(Error::config("当前 sink 是 console，没有建表语句")),
         }
     }
@@ -395,6 +398,7 @@ impl Config {
             database,
             table,
             cluster,
+            timezone,
             user,
             password,
             async_insert,
@@ -412,6 +416,15 @@ impl Config {
         if let Some(cluster) = cluster {
             sink = sink.cluster(cluster);
         }
+        if let Some(timezone) = timezone {
+            let tz: chrono_tz::Tz = timezone.parse().map_err(|_| {
+                Error::config(format!(
+                    "sink.timezone `{timezone}` 不是合法的 IANA 时区名（例：Asia/Shanghai）"
+                ))
+            })?;
+            sink = sink.timezone(tz);
+        }
+        sink = sink.extra_columns(self.extra_columns());
         if let Some(user) = user {
             sink = sink.auth(user, password.clone().unwrap_or_default());
         }
@@ -645,6 +658,67 @@ fields:
     }
 
     #[test]
+    fn timezone_goes_into_timestamp_column_only() {
+        let base = r#"
+source:
+  type: kubernetes
+sink:
+  type: clickhouse
+  endpoint: http://127.0.0.1:8123
+  database: logs
+  table: app_log
+"#;
+        let ddl = Config::parse(base).unwrap().ddl().unwrap();
+        assert!(ddl.contains("`timestamp` DateTime64(3),"), "{ddl}");
+        // 按 trace id 反查日志用的跳数索引，单机/集群都带
+        assert!(
+            ddl.contains("INDEX `idx_trace_id` `trace_id` TYPE bloom_filter"),
+            "{ddl}"
+        );
+        // 没配 timezone 就别去 MODIFY 人家手工标好时区的列
+        assert!(!ddl.contains("MODIFY COLUMN"), "{ddl}");
+        // 老表靠幂等 ALTER 补齐：k8s 元数据列、索引都在里面，timestamp 不 ADD
+        assert!(ddl.contains("ALTER TABLE `logs`.`app_log`\n"), "{ddl}");
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS `pod` String"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("ADD INDEX IF NOT EXISTS `idx_trace_id`"),
+            "{ddl}"
+        );
+        assert!(
+            !ddl.contains("ADD COLUMN IF NOT EXISTS `timestamp`"),
+            "{ddl}"
+        );
+        // main 会在末尾补分号，这里不能自带
+        assert!(!ddl.trim_end().ends_with(';'), "{ddl}");
+
+        let bad = Config::parse(&format!("{base}  timezone: Asia/Beijing\n"))
+            .unwrap()
+            .ddl();
+        assert!(bad.is_err(), "Asia/Beijing 不是 IANA 时区名");
+
+        let ddl = Config::parse(&format!("{base}  timezone: Asia/Shanghai\n"))
+            .unwrap()
+            .ddl()
+            .unwrap();
+        assert!(
+            ddl.contains("`timestamp` DateTime64(3, 'Asia/Shanghai'),"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("MODIFY COLUMN `timestamp` DateTime64(3, 'Asia/Shanghai')"),
+            "{ddl}"
+        );
+        // 分区 / TTL 表达式不受影响
+        assert!(
+            ddl.contains("PARTITION BY toYYYYMMDD(`timestamp`)"),
+            "{ddl}"
+        );
+    }
+
+    #[test]
     fn cluster_ddl_is_replicated_plus_distributed() {
         let config = Config::parse(
             r#"
@@ -671,9 +745,31 @@ sink:
             ddl.contains("Distributed(`bj_ck`, `logs`, `app_log_local`, rand())"),
             "{ddl}"
         );
-        // 两条语句，中间要有分号，不然 --ddl 出来的脚本没法直接执行
+        // 建两张表、补两张表，四条语句，中间要有分号，不然 --ddl 出来的脚本没法直接执行
         assert_eq!(ddl.matches("CREATE TABLE").count(), 2, "{ddl}");
-        assert!(ddl.contains(";"), "{ddl}");
+        assert_eq!(ddl.matches("ALTER TABLE").count(), 2, "{ddl}");
+        assert_eq!(ddl.matches(";\n").count(), 3, "{ddl}");
+        // 补表也全部 ON CLUSTER；索引只加在本地表上，Distributed 不支持跳数索引
+        assert!(
+            ddl.contains("ALTER TABLE `logs`.`app_log_local` ON CLUSTER `bj_ck`"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("ALTER TABLE `logs`.`app_log` ON CLUSTER `bj_ck`"),
+            "{ddl}"
+        );
+        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 1, "{ddl}");
+        let local_alter = ddl.find("ALTER TABLE `logs`.`app_log_local`").unwrap();
+        let dist_alter = ddl.find("ALTER TABLE `logs`.`app_log` ON").unwrap();
+        assert!(
+            local_alter < dist_alter,
+            "先补本地表再补 Distributed 表:\n{ddl}"
+        );
+        assert_eq!(
+            ddl.matches("ADD COLUMN IF NOT EXISTS `pod`").count(),
+            2,
+            "{ddl}"
+        );
         // 宏留给 ClickHouse 自己展开
         assert!(
             ddl.contains("{shard}") && ddl.contains("{replica}"),

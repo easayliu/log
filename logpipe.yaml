@@ -49,6 +49,9 @@ sink:
 #   # ReplicatedMergeTree 本地表 app_log_local + Distributed 表 app_log，
 #   # 两条都带 ON CLUSTER；sink 还是往 table 写，写入路径不变。单机不用填。
 #   cluster: ""
+#   # 日志时间戳所在的时区。只影响 --ddl：timestamp 列建成 DateTime64(3, 'Asia/Shanghai')，
+#   # 存的值不变。要和 Jaeger / Grafana 按绝对时间联动就必须填，否则差 8 小时查不到。
+#   timezone: Asia/Shanghai
 #   user: default
 #   password: ""
 #   async_insert: false    # 打开后由 ClickHouse 服务端再攒一层批

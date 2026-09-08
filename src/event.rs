@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{Local, NaiveDateTime};
+use chrono::{FixedOffset, Local, NaiveDateTime};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -144,15 +144,45 @@ fn estimated_value_size(value: &Value) -> usize {
 /// 序列化开销的四成；这里直接按位写进栈上的定长缓冲。
 impl Serialize for LogEvent {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.serialize_with_offset(serializer, None)
+    }
+}
+
+/// 时间戳带上时区偏移再序列化：`2026-09-07 11:04:08.914+08:00`，其余字段不变。
+///
+/// ClickHouse sink 配了 `timezone` 时用这个。裸的 `11:04:08.914` 存进去是哪个时刻
+/// 取决于列（或服务端）的时区，表结构没跟上就存错，而且错了没法事后区分。带上偏移
+/// 之后存进去的绝对时刻一定是对的，列上的时区只剩「查出来显示成几点」这一个作用。
+pub struct WithOffset<'a> {
+    pub event: &'a LogEvent,
+    pub offset: FixedOffset,
+}
+
+impl Serialize for WithOffset<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.event
+            .serialize_with_offset(serializer, Some(self.offset))
+    }
+}
+
+impl LogEvent {
+    fn serialize_with_offset<S: Serializer>(
+        &self,
+        serializer: S,
+        offset: Option<FixedOffset>,
+    ) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
         let mut map = serializer.serialize_map(None)?;
-        match format_timestamp(&self.timestamp) {
-            Some(buf) => map.serialize_entry("timestamp", from_ascii(&buf))?,
-            None => map.serialize_entry(
-                "timestamp",
-                &self.timestamp.format(TIMESTAMP_FORMAT).to_string(),
-            )?,
+        match format_timestamp(&self.timestamp, offset) {
+            Some((buf, len)) => map.serialize_entry("timestamp", from_ascii(&buf[..len]))?,
+            None => {
+                let mut raw = self.timestamp.format(TIMESTAMP_FORMAT).to_string();
+                if let Some(offset) = offset {
+                    raw.push_str(&offset.to_string());
+                }
+                map.serialize_entry("timestamp", &raw)?
+            }
         }
         map.serialize_entry("level", &self.level)?;
         map.serialize_entry("trace_id", &self.trace_id)?;
@@ -176,10 +206,11 @@ impl Serialize for LogEvent {
     }
 }
 
-/// `2026-09-07 11:04:08.914` 按位写进定长缓冲，等价于 [`TIMESTAMP_FORMAT`]。
+/// `2026-09-07 11:04:08.914` 按位写进定长缓冲，等价于 [`TIMESTAMP_FORMAT`]；
+/// 给了 `offset` 就再接上 `+08:00`。返回缓冲和实际写了多少字节。
 ///
 /// 年份不在四位数范围内、或者闰秒把毫秒推过 999 时返回 `None`，交给 chrono 走慢路径。
-fn format_timestamp(ts: &NaiveDateTime) -> Option<[u8; 23]> {
+fn format_timestamp(ts: &NaiveDateTime, offset: Option<FixedOffset>) -> Option<([u8; 29], usize)> {
     use chrono::{Datelike, Timelike};
 
     let year = ts.year();
@@ -198,7 +229,7 @@ fn format_timestamp(ts: &NaiveDateTime) -> Option<[u8; 23]> {
         }
     }
 
-    let mut buf = *b"0000-00-00 00:00:00.000";
+    let mut buf = *b"0000-00-00 00:00:00.000+00:00";
     put(&mut buf[0..4], year as u32);
     put(&mut buf[5..7], ts.month());
     put(&mut buf[8..10], ts.day());
@@ -206,7 +237,17 @@ fn format_timestamp(ts: &NaiveDateTime) -> Option<[u8; 23]> {
     put(&mut buf[14..16], ts.minute());
     put(&mut buf[17..19], ts.second());
     put(&mut buf[20..23], millis);
-    Some(buf)
+    let Some(offset) = offset else {
+        return Some((buf, 23));
+    };
+    let seconds = offset.local_minus_utc();
+    if seconds < 0 {
+        buf[23] = b'-';
+    }
+    let minutes = seconds.unsigned_abs() / 60;
+    put(&mut buf[24..26], minutes / 60);
+    put(&mut buf[27..29], minutes % 60);
+    Some((buf, 29))
 }
 
 fn from_ascii(buf: &[u8]) -> &str {
@@ -269,25 +310,27 @@ mod tests {
         ];
         for raw in cases {
             let ts = NaiveDateTime::parse_from_str(raw, TIMESTAMP_FORMAT).unwrap();
-            let fast = format_timestamp(&ts).unwrap();
-            assert_eq!(from_ascii(&fast), ts.format(TIMESTAMP_FORMAT).to_string());
-            assert_eq!(from_ascii(&fast), raw);
+            let (fast, len) = format_timestamp(&ts, None).unwrap();
+            assert_eq!(len, 23);
+            assert_eq!(
+                from_ascii(&fast[..len]),
+                ts.format(TIMESTAMP_FORMAT).to_string()
+            );
+            assert_eq!(from_ascii(&fast[..len]), raw);
         }
         // 纳秒截断到毫秒，不四舍五入
         let ts = NaiveDateTime::parse_from_str("2026-09-07 11:04:08", "%Y-%m-%d %H:%M:%S")
             .unwrap()
             .with_nanosecond(999_999_999)
             .unwrap();
-        assert_eq!(
-            from_ascii(&format_timestamp(&ts).unwrap()),
-            "2026-09-07 11:04:08.999"
-        );
+        let (fast, len) = format_timestamp(&ts, None).unwrap();
+        assert_eq!(from_ascii(&fast[..len]), "2026-09-07 11:04:08.999");
         // 四位数之外的年份走慢路径
         let ancient = NaiveDate::from_ymd_opt(-1, 1, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        assert!(format_timestamp(&ancient).is_none());
+        assert!(format_timestamp(&ancient, None).is_none());
         let json: Value = serde_json::from_str(
             &LogEvent {
                 timestamp: ancient,
@@ -300,6 +343,62 @@ mod tests {
         assert_eq!(
             json["timestamp"],
             ancient.format(TIMESTAMP_FORMAT).to_string()
+        );
+    }
+
+    #[test]
+    fn with_offset_appends_zone_and_matches_chrono() {
+        let ts =
+            NaiveDateTime::parse_from_str("2026-09-07 11:04:08.914", TIMESTAMP_FORMAT).unwrap();
+        for (secs, expect) in [
+            (8 * 3600, "2026-09-07 11:04:08.914+08:00"),
+            (-5 * 3600 - 1800, "2026-09-07 11:04:08.914-05:30"),
+            (0, "2026-09-07 11:04:08.914+00:00"),
+        ] {
+            let offset = FixedOffset::east_opt(secs).unwrap();
+            let (fast, len) = format_timestamp(&ts, Some(offset)).unwrap();
+            assert_eq!(from_ascii(&fast[..len]), expect);
+            // 和 chrono 自己的 `%:z` 一致
+            assert_eq!(
+                from_ascii(&fast[..len]),
+                format!("{}{}", ts.format(TIMESTAMP_FORMAT), offset)
+            );
+
+            let event = LogEvent {
+                timestamp: ts,
+                ..Default::default()
+            };
+            let json: Value = serde_json::from_str(
+                &serde_json::to_string(&WithOffset {
+                    event: &event,
+                    offset,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(json["timestamp"], expect);
+        }
+        // 慢路径同样带偏移
+        let ancient = NaiveDate::from_ymd_opt(-1, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let offset = FixedOffset::east_opt(8 * 3600).unwrap();
+        let event = LogEvent {
+            timestamp: ancient,
+            ..Default::default()
+        };
+        let json: Value = serde_json::from_str(
+            &serde_json::to_string(&WithOffset {
+                event: &event,
+                offset,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            json["timestamp"],
+            format!("{}+08:00", ancient.format(TIMESTAMP_FORMAT))
         );
     }
 
