@@ -39,6 +39,8 @@ async fn main() -> logpipe::Result<()> {
         .source(
             FileSource::kubernetes()
                 .pod_selector(selector)
+                // service_name 取 pod 的 app label，要能访问 API server（RBAC 见 deploy/）
+                .service_name_label("app")
                 .data_dir("/var/lib/logpipe"),
         )
         .sink(ClickhouseSink::new(

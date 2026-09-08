@@ -44,7 +44,7 @@ pub enum SourceConfig {
 }
 
 impl SourceConfig {
-    /// 事件里是否会带上 namespace / pod / container / stream 这几列。
+    /// 事件里是否会带上 namespace / pod / container / stream / service_name 这几列。
     pub fn emits_pod_metadata(&self) -> bool {
         match self {
             SourceConfig::Kubernetes(_) => true,
@@ -74,6 +74,12 @@ pub struct KubernetesSourceConfig {
     /// 不采自己（默认开）。容器里的 hostname 就是 pod 名，不需要额外配置。
     #[serde(default = "yes")]
     pub exclude_self: bool,
+    /// `service_name` 列取 pod 的哪个 label，默认 `app`，和 trace 那边的 service 对齐。
+    /// label 不在日志路径里，要访问 API server（ServiceAccount + `pods` 的 `get`，
+    /// 见 `deploy/logpipe-daemonset.yaml`）。设成空串就不访问 API server，
+    /// `service_name` 只剩静态 `fields.service_name`。
+    #[serde(default = "default_service_name_label")]
+    pub service_name_label: String,
     /// kubelet 的日志目录。标准路径是 `/var/log/pods`，一般不用改。
     #[serde(default = "default_pod_log_dir")]
     pub log_dir: String,
@@ -242,6 +248,10 @@ fn default_initial_backoff_ms() -> u64 {
 fn default_buffer() -> usize {
     64
 }
+fn default_service_name_label() -> String {
+    "app".to_owned()
+}
+
 fn default_pod_log_dir() -> String {
     crate::source::k8s::DEFAULT_POD_LOG_DIR.to_owned()
 }
@@ -381,13 +391,18 @@ impl Config {
                 ("namespace", "LowCardinality(String)"),
                 ("pod", "String"),
                 ("container", "LowCardinality(String)"),
+                // pod 的 label（默认 app），和 Jaeger 的 service_name 对齐
+                ("service_name", "LowCardinality(String)"),
             ] {
                 columns.push((name.to_owned(), ty.to_owned()));
             }
         }
 
+        // 静态字段和元数据列同名（比如手配 service_name 兜底）时列只建一份
         for (key, value) in &self.fields {
-            columns.push((key.clone(), column_type_of(value)));
+            if !columns.iter().any(|(name, _)| name == key) {
+                columns.push((key.clone(), column_type_of(value)));
+            }
         }
         columns
     }
@@ -468,6 +483,7 @@ impl Config {
 
                 let mut source = FileSource::kubernetes_in(&k8s.log_dir)
                     .pod_selector(selector)
+                    .service_name_label(&k8s.service_name_label)
                     .parser(parser)
                     .read_from_beginning(k8s.read_from_beginning)
                     .glob_interval(Duration::from_secs(k8s.glob_interval_secs));
@@ -608,6 +624,7 @@ sink:
         assert!(k8s.exclude_self);
         assert!(!k8s.read_from_beginning);
         assert!(k8s.namespaces.is_empty(), "留空表示全采");
+        assert_eq!(k8s.service_name_label, "app", "默认取 pod 的 app label");
         config.build().unwrap();
     }
 
@@ -649,11 +666,12 @@ fields:
             "`namespace`",
             "`pod`",
             "`container`",
+            "`service_name`",
             "`cluster`",
         ] {
             assert!(ddl.contains(column), "DDL 少了 {column}:\n{ddl}");
         }
-        assert!(ddl.contains("`replica`   Int64"));
+        assert!(ddl.contains("`replica`      Int64"));
         config.build().unwrap();
     }
 
@@ -669,7 +687,7 @@ sink:
   table: app_log
 "#;
         let ddl = Config::parse(base).unwrap().ddl().unwrap();
-        assert!(ddl.contains("`timestamp` DateTime64(3),"), "{ddl}");
+        assert!(ddl.contains("`timestamp`    DateTime64(3),"), "{ddl}");
         // 按 trace id 反查日志用的跳数索引，单机/集群都带
         assert!(
             ddl.contains("INDEX `idx_trace_id` `trace_id` TYPE bloom_filter"),
@@ -704,7 +722,7 @@ sink:
             .ddl()
             .unwrap();
         assert!(
-            ddl.contains("`timestamp` DateTime64(3, 'Asia/Shanghai'),"),
+            ddl.contains("`timestamp`    DateTime64(3, 'Asia/Shanghai'),"),
             "{ddl}"
         );
         assert!(

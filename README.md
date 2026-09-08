@@ -173,7 +173,7 @@ async fn main() -> logpipe::Result<()> {
 
 ## 表结构
 
-字段由程序定义（上面那 9 个，外加容器元数据列和 `fields` 里的静态字段），
+字段由程序定义（上面那 9 个，外加容器元数据列、`service_name` 和 `fields` 里的静态字段），
 **建表由你自己执行**，采集进程不执行任何 DDL ——
 分区键、排序键、TTL、引擎这些线上细节留在你手里。启动时只做校验：`require_healthy: true`
 的情况下会 `SELECT 1` + `EXISTS TABLE` + 对一遍 `system.columns`，表不存在或者
@@ -186,15 +186,16 @@ cargo run -- --ddl logpipe.yaml | clickhouse-client
 ```sql
 CREATE TABLE IF NOT EXISTS `logs`.`app_log`
 (
-    `timestamp` DateTime64(3),
-    `level`     LowCardinality(String),
-    `trace_id`  String,
-    `span_id`   String,
-    `thread`    String,
-    `logger`    String,
-    `message`   String,
-    `file`      String,
-    `host`      LowCardinality(String),
+    `timestamp`    DateTime64(3),
+    `level`        LowCardinality(String),
+    `trace_id`     String,
+    `span_id`      String,
+    `thread`       String,
+    `logger`       String,
+    `message`      String,
+    `file`         String,
+    `host`         LowCardinality(String),
+    `service_name` LowCardinality(String),
     INDEX `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree
@@ -218,7 +219,7 @@ ALTER TABLE `logs`.`app_log`
 * 配置里 `fields` 加的静态字段（`cluster`、`env`……）**`--ddl` 会自动带上对应的列**，
   类型按值推断：字符串 → `LowCardinality(String)`、整数 → `Int64`、小数 → `Float64`、
   布尔 → `UInt8`。采容器日志时（`type: kubernetes`）`stream` / `namespace` / `pod` /
-  `container` 四列同样自动带上。
+  `container` / `service_name` 五列同样自动带上。
 * **给线上配置新加了 `fields`，重跑一次 `--ddl` 的输出（ddl Job）。**忘了也不会
   丢数据以外的东西：插入带着 `input_format_skip_unknown_fields=1`，表里没这列不报错、
   整批也不失败，只是那个字段被丢掉；但采集进程启动时会对一遍列，缺了直接报错退出，
@@ -323,6 +324,24 @@ Grafana 两个方向各接一次：
 * **Jaeger → 日志**：Jaeger 数据源 → Trace to logs → 选 ClickHouse 数据源、勾 custom
   query，查询写 `trace_id = '${__span.traceId}'`，时间偏移各留一两分钟兜异步日志。
 
+**按服务对齐**。除了 trace id，两张表还有一个共同的维度：`service_name`。Jaeger 里的
+service 是应用上报时带的 `service.name`，trace 那边从 pod 的 `app` label 取；日志这边
+同样**直接取 pod 的 `app` label**，不从 pod 名去猜，两边一定是同一个字符串。
+所以「某个服务这一分钟的错误日志」和「它这一分钟的慢 span」能在
+`(service_name, timestamp)` 上对上：
+
+```sql
+select service_name, count() as errors
+from logs.app_log
+where timestamp between '2026-09-07 11:00:00' and '2026-09-07 11:01:00'
+  and level = 'ERROR'
+group by service_name
+```
+
+k8s 采集时 label 由 `source.service_name_label` 指定（默认 `app`，用
+`app.kubernetes.io/name` 的集群改这里）。采文件时没有 pod，用 `fields.service_name`
+静态配，值要和 Jaeger 里的 service 一致。
+
 不走 Grafana 的话，拿到 trace id 直接查：
 
 ```sql
@@ -372,6 +391,7 @@ source:
 | `exclude_self` | `true` | 不采自己，避免自我循环。容器里 hostname 就是 pod 名，不需要额外配置 |
 | `read_from_beginning` | `false` | 只收增量，首次部署不会把节点上的历史日志全灌一遍 |
 | `glob_interval_secs` | `10` | 多久扫一次新容器 |
+| `service_name_label` | `app` | `service_name` 列取 pod 的哪个 label；`""` 关掉 |
 | 轮转文件 | 一起采 | kubelet 轮转出的 `0.log.20260907-...` 也读，见下面「文件轮转」 |
 
 程序做的事：
@@ -379,12 +399,19 @@ source:
 * 剥掉运行时外壳，把里面的应用日志交给 logback 解析器；
 * 被切成 `P` 片段的超长行**先拼回整行**再解析；
 * 从路径解出 `namespace` / `pod` / `container`，连同 `stream`（stdout/stderr）写进去 ——
-  **不访问 API server**，所以不需要 ServiceAccount / RBAC；
+  这几个不访问 API server；
+* `service_name` 取 pod 的 `app` label（`service_name_label` 可改），和 Jaeger 里的
+  service 对齐。label 不在路径里，这一项要问 API server：每个 pod **第一次出现时
+  GET 一次**，结果缓存，同一个 pod 的多个容器、轮转文件不重复查。API server 一时不通
+  不影响采集，日志照收，`service_name` 先取退路值（`fields.service_name`，没有就是空串），
+  每轮扫描重试直到查到；pod 没这个 label 或已被删除时也用退路值。所以 DaemonSet 带
+  一个只能 `get pods` 的 ServiceAccount（在 `deploy/logpipe-daemonset.yaml` 里）。
+  不想给 API 权限就 `service_name_label: ""`，回到完全不碰 API server 的行为；
 * 写到 stderr 的异常堆栈照样合并进上一条日志；
 * `--ddl` 自动带上这几列，不用手改。
 
-> 按 label / annotation 选容器做不到 —— 那些不在路径里，得访问 API server。
-> 现在的选择维度是 namespace / pod 名 / container 名，覆盖了绝大多数场景
+> 按 label / annotation **选**容器还是做不到 —— 采不采在打开文件时就要定，那时还没问过
+> API server。现在的选择维度是 namespace / pod 名 / container 名，覆盖了绝大多数场景
 > （pod 名带 Deployment 前缀，`pods: ["order-*"]` 基本等价于按服务选）。
 
 部署是 DaemonSet（每节点一个），`deploy/logpipe-daemonset.yaml` 可以直接 apply，
@@ -417,7 +444,7 @@ Job 里 `apply-ddl` 容器的 `CH_HOST` / `CH_DATABASE` / `CH_CLUSTER` / `CH_USE
 ```bash
 kubectl -n logging get cm logpipe-config -o jsonpath='{.data.logpipe\.yaml}' > /tmp/logpipe.yaml
 docker run --rm -v /tmp/logpipe.yaml:/etc/logpipe/logpipe.yaml:ro \
-  ghcr.io/easayliu/log:v0.1.7 --ddl /etc/logpipe/logpipe.yaml
+  ghcr.io/easayliu/log:v0.1.8 --ddl /etc/logpipe/logpipe.yaml
 ```
 
 要点：容器日志文件是 root `0600`，所以 `runAsUser: 0`；位点目录挂 hostPath 才能在 Pod

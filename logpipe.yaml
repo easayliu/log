@@ -78,3 +78,6 @@ pipeline:
 fields:
   app: order-service
   env: prod
+  # 采文件时 service_name 只能在这里静态配（k8s 采集是从 pod 的 label 取）。
+  # 和 Jaeger 里的 service 写成一样的，两张表才能按 (service_name, timestamp) 对上
+  # service_name: order-service

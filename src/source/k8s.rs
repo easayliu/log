@@ -1,13 +1,17 @@
-//! 从容器日志的**文件路径**里解出 k8s 元数据，不需要访问 API server。
+//! k8s 元数据。
 //!
-//! 支持两种常见布局：
+//! namespace / pod / container 从容器日志的**文件路径**里解出来，不访问 API server：
 //!
 //! ```text
 //! /var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log          kubelet 真实文件
 //! /var/log/containers/<pod>_<namespace>_<container>-<id>.log       指向上面的软链
 //! ```
+//!
+//! `service_name` 是 pod 的 label（默认 `app`），路径里没有，得问 API server
+//! —— [`KubeClient`] 只干这一件事：`GET /api/v1/namespaces/{ns}/pods/{pod}`。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use glob::Pattern;
 
@@ -93,6 +97,147 @@ mod tests {
     #[test]
     fn returns_none_for_plain_paths() {
         assert!(parse_pod_path(Path::new("/var/log/app/app.log")).is_none());
+    }
+}
+
+/// 只读 pod 对象的 API server 客户端，用来取 pod 的 label 当 `service_name`。
+///
+/// 不引 `kube` 那一整套（几十个 crate、要生成的 API 类型），需要的只是一个 GET：
+/// 复用 ClickHouse sink 已经在用的 reqwest。集群里用 [`KubeClient::in_cluster`]，
+/// 从 ServiceAccount 的挂载读 token 和 CA；RBAC 只要 `pods` 的 `get`。
+#[derive(Clone, Debug)]
+pub struct KubeClient {
+    client: reqwest::Client,
+    base: String,
+    token: Option<TokenSource>,
+}
+
+#[derive(Clone, Debug)]
+enum TokenSource {
+    /// ServiceAccount 的投影 token 会轮换（默认一小时），kubelet 原地改写文件，
+    /// 所以每次请求重读，而不是启动时读一次。
+    File(PathBuf),
+    Static(String),
+}
+
+/// ServiceAccount 挂载的标准位置。
+const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
+impl KubeClient {
+    /// 直接给 API server 地址（形如 `http://127.0.0.1:8001`），不带认证。
+    /// 给测试和 `kubectl proxy` 用；集群里用 [`Self::in_cluster`]。
+    pub fn new(base: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("reqwest client"),
+            base: base.into().trim_end_matches('/').to_owned(),
+            token: None,
+        }
+    }
+
+    /// 固定的 Bearer token。
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(TokenSource::Static(token.into()));
+        self
+    }
+
+    /// 按 Pod 里的标准环境组装：`KUBERNETES_SERVICE_HOST` / `_PORT` 定位 API server，
+    /// ServiceAccount 挂载目录里的 `token` 和 `ca.crt` 做认证。
+    pub fn in_cluster() -> Result<Self> {
+        let host = std::env::var("KUBERNETES_SERVICE_HOST").ok();
+        let port = std::env::var("KUBERNETES_SERVICE_PORT").ok();
+        let (Some(host), Some(port)) = (host, port) else {
+            return Err(Error::config(
+                "不在 k8s 集群里（没有 KUBERNETES_SERVICE_HOST），取不到 pod 的 label；\
+                 不需要 service_name 的话把 source.service_name_label 设成空串",
+            ));
+        };
+        let sa_dir = Path::new(SA_DIR);
+        let token_path = sa_dir.join("token");
+        if !token_path.is_file() {
+            return Err(Error::config(format!(
+                "{} 不存在：Pod 没挂 ServiceAccount token（automountServiceAccountToken 被关了？）",
+                token_path.display()
+            )));
+        }
+        let ca = std::fs::read(sa_dir.join("ca.crt"))
+            .map_err(|err| Error::io("读取 API server 的 CA 证书失败", err))?;
+        let ca = reqwest::Certificate::from_pem(&ca)
+            .map_err(|err| Error::config(format!("API server 的 CA 证书不合法: {err}")))?;
+        let client = reqwest::Client::builder()
+            .add_root_certificate(ca)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|err| Error::config(format!("初始化 API server 客户端失败: {err}")))?;
+        // IPv6 的 service ip 要加方括号
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
+        Ok(Self {
+            client,
+            base: format!("https://{host}:{port}"),
+            token: Some(TokenSource::File(token_path)),
+        })
+    }
+
+    /// 取 pod 的一个 label。
+    ///
+    /// * `Ok(Some(v))`：有这个 label；
+    /// * `Ok(None)`：pod 在但没这个 label，或者 pod 已经没了（404，日志目录会比 pod
+    ///   多活一阵）—— 两种都是**定论**，不必再试；
+    /// * `Err`：网络、超时、401/403 这类，调用方稍后重试。403 的报错里带 RBAC 提示。
+    pub async fn pod_label(
+        &self,
+        namespace: &str,
+        pod: &str,
+        label: &str,
+    ) -> Result<Option<String>> {
+        let url = format!("{}/api/v1/namespaces/{namespace}/pods/{pod}", self.base);
+        let mut request = self.client.get(&url).header("Accept", "application/json");
+        if let Some(token) = &self.token {
+            let token = match token {
+                TokenSource::Static(token) => token.clone(),
+                TokenSource::File(path) => std::fs::read_to_string(path)
+                    .map_err(|err| Error::io("读取 ServiceAccount token 失败", err))?,
+            };
+            request = request.bearer_auth(token.trim());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|err| Error::source(format!("请求 API server 失败 {url}: {err}")))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|err| Error::source(format!("读 API server 响应失败 {url}: {err}")))?;
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(Error::source(format!(
+                "API server 拒绝 GET {url}：ServiceAccount 没有 pods 的 get 权限，\
+                 见 deploy/logpipe-daemonset.yaml 里的 ClusterRole；{}",
+                body.trim()
+            )));
+        }
+        if !status.is_success() {
+            return Err(Error::source(format!(
+                "API server 返回 {status} {url}: {}",
+                body.trim()
+            )));
+        }
+        let object: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|err| Error::source(format!("API server 返回的不是 JSON {url}: {err}")))?;
+        Ok(object
+            .pointer("/metadata/labels")
+            .and_then(|labels| labels.get(label))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned))
     }
 }
 

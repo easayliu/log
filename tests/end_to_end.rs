@@ -804,3 +804,109 @@ async fn fallback_lines_are_not_resent_after_restart() {
         events[0].message
     );
 }
+
+/// 假 API server：按路径回 pod 对象，其余 404。记下收到的请求头，回完就关连接。
+fn fake_api_server(pods: Vec<(&'static str, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                if n == 0 || raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&raw).to_string();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+            seen.lock().unwrap().push(head);
+            let (status, body) = match pods.iter().find(|(p, _)| *p == path) {
+                Some((_, body)) => ("200 OK", (*body).to_owned()),
+                None => (
+                    "404 Not Found",
+                    r#"{"kind":"Status","code":404}"#.to_owned(),
+                ),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+/// `service_name` 直接取 pod 的 label，不猜：同一个 pod 只问一次 API server，
+/// 查不到的退回静态 `fields.service_name`。
+#[tokio::test]
+async fn kubernetes_source_takes_service_name_from_pod_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let pods = dir.path().join("pods");
+    // order-service 两个容器 + 一个 API server 里已经没了的 pod
+    for (pod, container) in [
+        ("order-service-7d9f8b6c4-abcde", "app"),
+        ("order-service-7d9f8b6c4-abcde", "sidecar"),
+        ("gone-0", "app"),
+    ] {
+        let log_dir = pods.join(format!("prod_{pod}_1f2e3d4c")).join(container);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        append(&log_dir.join("0.log"), &[&cri(&logline(1, container))]);
+    }
+
+    let (endpoint, requests) = fake_api_server(vec![(
+        "/api/v1/namespaces/prod/pods/order-service-7d9f8b6c4-abcde",
+        r#"{"kind":"Pod","metadata":{"name":"order-service-7d9f8b6c4-abcde","labels":{"app":"order-service","pod-template-hash":"7d9f8b6c4"}}}"#,
+    )]);
+
+    let sink = MemorySink::new();
+    let events = sink.events();
+    let running = Pipeline::builder()
+        .source(
+            k8s_source(&pods, dir.path())
+                .read_from_beginning(true)
+                .service_name_label("app")
+                .kube_client(logpipe::source::k8s::KubeClient::new(&endpoint).token("sa-token"))
+                .fields([("service_name".to_owned(), "fallback".into())].into()),
+        )
+        .sink(sink)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+
+    wait_for(|| events.lock().unwrap().len() == 3, "三条容器日志").await;
+    running.stop().await.unwrap();
+
+    let events = events.lock().unwrap();
+    for event in events.iter() {
+        let expect = match event.get("pod").unwrap().as_str().unwrap() {
+            "order-service-7d9f8b6c4-abcde" => "order-service",
+            // API server 404：退回静态 fields.service_name
+            "gone-0" => "fallback",
+            other => panic!("多出来的 pod {other}"),
+        };
+        assert_eq!(
+            event.get("service_name").unwrap(),
+            expect,
+            "container = {}",
+            event.get("container").unwrap()
+        );
+    }
+
+    let requests = requests.lock().unwrap();
+    // 两个容器共一个 pod，只查一次；gone-0 一次
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.to_lowercase().contains("authorization: bearer sa-token")),
+        "{requests:?}"
+    );
+}

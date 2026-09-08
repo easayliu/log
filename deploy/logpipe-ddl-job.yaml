@@ -1,4 +1,5 @@
-# 建库建表。DaemonSet 之前跑一次；之后每次改了配置里的 fields / timezone 再重跑一次，
+# 建库建表。DaemonSet 之前跑一次；之后每次改了配置里的 fields / timezone、或者升级到
+# 带新列的版本（比如加 service_name 列的那一版）再重跑一次，
 # DDL 里带着幂等的 ALTER 段，老表缺的列、索引、时区会被补齐，多跑无副作用。
 #
 # 为什么要单独一个 Job：logpipe 自己从不执行 DDL，`--ddl` 只把建表语句打到 stdout
@@ -22,7 +23,7 @@ spec:
       initContainers:
         - name: render-ddl
           # 和 DaemonSet 用同一个 tag，否则可能渲染出跟采集端不一致的列
-          image: ghcr.io/easayliu/log:v0.1.7
+          image: ghcr.io/easayliu/log:v0.1.8
           command: ["/bin/sh", "-c"]
           args:
             - |

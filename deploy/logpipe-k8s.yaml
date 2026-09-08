@@ -12,6 +12,9 @@ source:
   exclude_containers: [istio-proxy, linkerd-proxy]
   # 位点落在宿主机上，Pod 重建后续读
   data_dir: /var/lib/logpipe
+  # service_name 列取 pod 的哪个 label（默认 app），和 trace 那边的 service 对齐。
+  # 要访问 API server，RBAC 见 logpipe-daemonset.yaml；设成 "" 就不访问
+  service_name_label: app
   # 以下都有默认值，一般不用写：
   # log_dir: /var/log/pods       kubelet 标准路径
   # exclude_self: true           不采自己

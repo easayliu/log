@@ -22,7 +22,7 @@ use crate::event::LogEvent;
 use crate::parser::{Aggregator, ContainerFormat, LogbackParser, Parser};
 use crate::shutdown::Shutdown;
 use crate::source::checkpoint::Checkpointer;
-use crate::source::k8s::{self, PodSelector};
+use crate::source::k8s::{self, KubeClient, PodMeta, PodSelector};
 use crate::source::{Source, SourceSender};
 
 const READ_CHUNK: usize = 64 * 1024;
@@ -44,6 +44,10 @@ pub struct FileSource {
     host: Arc<str>,
     container_format: ContainerFormat,
     pod_selector: Option<PodSelector>,
+    /// `service_name` 取 pod 的哪个 label。设了就要访问 API server。
+    service_name_label: Option<String>,
+    /// 不设则在 `run` 时按集群内环境组装（[`KubeClient::in_cluster`]）。
+    kube: Option<KubeClient>,
     read_from_beginning: bool,
     glob_interval: Duration,
     read_interval: Duration,
@@ -69,6 +73,8 @@ impl FileSource {
             host: Arc::from(hostname()),
             container_format: ContainerFormat::Raw,
             pod_selector: None,
+            service_name_label: None,
+            kube: None,
             read_from_beginning: true,
             glob_interval: Duration::from_secs(10),
             read_interval: Duration::from_millis(500),
@@ -101,6 +107,24 @@ impl FileSource {
     /// 挑要采的容器（namespace / pod / container 名字，支持 glob）。
     pub fn pod_selector(mut self, selector: PodSelector) -> Self {
         self.pod_selector = Some(selector);
+        self
+    }
+
+    /// 把 pod 的这个 label（比如 `app`）写进 `service_name`，和 Jaeger 里的 service 对齐。
+    ///
+    /// label 不在日志路径里，要问 API server：每个 pod 查一次，结果缓存；没配
+    /// [`Self::kube_client`] 就在启动时按集群内环境组装，RBAC 只要 `pods` 的 `get`。
+    /// 查不到（pod 没这个 label、pod 已经没了）时退回静态 `fields.service_name`，
+    /// 那也没有就是空串。空串等于不设。
+    pub fn service_name_label(mut self, label: impl Into<String>) -> Self {
+        let label = label.into();
+        self.service_name_label = (!label.is_empty()).then_some(label);
+        self
+    }
+
+    /// 取 label 用的 API server 客户端。集群里不用设，测试和 `kubectl proxy` 场景用。
+    pub fn kube_client(mut self, client: KubeClient) -> Self {
+        self.kube = Some(client);
         self
     }
 
@@ -179,6 +203,7 @@ impl FileSource {
         order: &mut Vec<String>,
         checkpointer: &Checkpointer,
         first_pass: bool,
+        unresolved: &mut HashMap<String, u32>,
     ) -> Result<()> {
         let excludes = self
             .excludes
@@ -294,6 +319,7 @@ impl FileSource {
 
             // CRI 布局下从路径解出 k8s 元数据，并据此决定采不采。
             let mut shared = self.fields.clone();
+            let mut pod = None;
             if self.container_format == ContainerFormat::Cri {
                 match k8s::parse_pod_path(&path) {
                     Some(meta) => {
@@ -302,9 +328,10 @@ impl FileSource {
                                 continue;
                             }
                         }
-                        shared.insert("namespace".to_owned(), Value::from(meta.namespace));
-                        shared.insert("pod".to_owned(), Value::from(meta.pod));
-                        shared.insert("container".to_owned(), Value::from(meta.container));
+                        shared.insert("namespace".to_owned(), Value::from(meta.namespace.clone()));
+                        shared.insert("pod".to_owned(), Value::from(meta.pod.clone()));
+                        shared.insert("container".to_owned(), Value::from(meta.container.clone()));
+                        pod = Some(meta);
                     }
                     None => {
                         // 解不出元数据就无法判断该不该采，配了筛选条件时宁可不采。
@@ -318,11 +345,16 @@ impl FileSource {
             }
 
             tracing::info!(?path, offset = start, "开始采集");
+            // label 要问 API server，同步的 discover 里做不了，记下来交给 run 循环
+            if pod.is_some() && self.service_name_label.is_some() {
+                unresolved.insert(key.clone(), 0);
+            }
             order.push(key.clone());
             watchers.insert(
                 key.clone(),
                 Watcher {
                     key,
+                    pod,
                     file_field: Arc::from(path.display().to_string()),
                     path,
                     file,
@@ -343,12 +375,110 @@ impl FileSource {
     }
 }
 
+impl FileSource {
+    /// 给刚发现的容器补 `service_name`：问 API server 要 pod 的 label。
+    ///
+    /// 同一个 pod 的几个文件（多容器、轮转、重启后的 `1.log`）只查一次，结果按
+    /// `namespace/pod` 缓存。查询并发发出去 —— API server 挂了的话，每个超时 10 秒，
+    /// 串行等一个节点上百个 pod 会把采集卡住几分钟。
+    ///
+    /// 有定论的（有 label / 没 label / pod 没了）从 `unresolved` 里拿掉；出错的留着，
+    /// 下一轮扫描再试，日志照采不误，只是这段时间的 `service_name` 是退路值。
+    async fn resolve_service_names(
+        &self,
+        kube: &KubeClient,
+        label: &str,
+        watchers: &mut HashMap<String, Watcher>,
+        unresolved: &mut HashMap<String, u32>,
+        cache: &mut HashMap<String, Option<String>>,
+    ) {
+        // 先用缓存兜掉，剩下的按 pod 去重后并发查
+        let mut lookups: HashMap<String, PodMeta> = HashMap::new();
+        for (key, watcher) in watchers.iter_mut() {
+            let Some(attempts) = unresolved.get_mut(key) else {
+                continue;
+            };
+            let Some(meta) = &watcher.pod else {
+                unresolved.remove(key);
+                continue;
+            };
+            let pod_key = format!("{}/{}", meta.namespace, meta.pod);
+            if let Some(name) = cache.get(&pod_key) {
+                watcher.set_service_name(name.as_deref());
+                unresolved.remove(key);
+                continue;
+            }
+            *attempts += 1;
+            lookups.entry(pod_key).or_insert_with(|| meta.clone());
+        }
+        if lookups.is_empty() {
+            return;
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for (pod_key, meta) in lookups {
+            let kube = kube.clone();
+            let label = label.to_owned();
+            tasks.spawn(async move {
+                let result = kube.pod_label(&meta.namespace, &meta.pod, &label).await;
+                (pod_key, meta, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((pod_key, meta, result)) = joined else {
+                continue;
+            };
+            let name = match result {
+                Ok(name) => name,
+                Err(err) => {
+                    // 第一次用 warn 喊出来，之后每 10 秒一次的重试降到 debug，免得刷屏
+                    let first = watchers.values().any(|watcher| {
+                        watcher.same_pod(&meta)
+                            && unresolved.get(&watcher.key).is_some_and(|n| *n <= 1)
+                    });
+                    if first {
+                        tracing::warn!(namespace = %meta.namespace, pod = %meta.pod, %err,
+                            "取 pod 的 label 失败，service_name 先用退路值，稍后重试");
+                    } else {
+                        tracing::debug!(namespace = %meta.namespace, pod = %meta.pod, %err,
+                            "取 pod 的 label 仍然失败");
+                    }
+                    continue;
+                }
+            };
+            if name.is_none() {
+                tracing::warn!(namespace = %meta.namespace, pod = %meta.pod, label,
+                    "pod 没有这个 label（或已删除），service_name 用退路值");
+            }
+            for watcher in watchers.values_mut() {
+                if watcher.same_pod(&meta) {
+                    watcher.set_service_name(name.as_deref());
+                    unresolved.remove(&watcher.key);
+                }
+            }
+            cache.insert(pod_key, name);
+        }
+    }
+}
+
 #[async_trait]
 impl Source for FileSource {
     async fn run(self: Box<Self>, out: SourceSender, shutdown: Shutdown) -> Result<()> {
         if self.includes.is_empty() {
             return Err(Error::config("FileSource 至少需要一个 include 路径"));
         }
+
+        // label 要访问 API server：没显式给客户端就按集群内环境组装，不在集群里直接报错，
+        // 而不是每个 pod 都查失败一遍再说
+        let kube = match (&self.service_name_label, &self.kube) {
+            (Some(_), Some(client)) => Some(client.clone()),
+            (Some(_), None) if self.container_format == ContainerFormat::Cri => {
+                Some(KubeClient::in_cluster()?)
+            }
+            _ => None,
+        };
+        let mut unresolved: HashMap<String, u32> = HashMap::new();
+        let mut label_cache: HashMap<String, Option<String>> = HashMap::new();
 
         let checkpointer = Arc::new(Checkpointer::load(self.data_dir.as_deref())?);
         let mut watchers: HashMap<String, Watcher> = HashMap::new();
@@ -373,7 +503,25 @@ impl Source for FileSource {
 
             if last_glob.is_none_or(|at| at.elapsed() >= self.glob_interval) {
                 let first_pass = last_glob.is_none();
-                self.discover(&mut watchers, &mut order, &checkpointer, first_pass)?;
+                self.discover(
+                    &mut watchers,
+                    &mut order,
+                    &checkpointer,
+                    first_pass,
+                    &mut unresolved,
+                )?;
+                if let (Some(kube), Some(label)) = (&kube, &self.service_name_label) {
+                    if !unresolved.is_empty() {
+                        self.resolve_service_names(
+                            kube,
+                            label,
+                            &mut watchers,
+                            &mut unresolved,
+                            &mut label_cache,
+                        )
+                        .await;
+                    }
+                }
                 last_glob = Some(Instant::now());
 
                 // 首轮扫完清理孤儿位点。放在扫描之后是有意的：扫到了文件才说明日志
@@ -441,6 +589,7 @@ impl Source for FileSource {
                     tracing::info!(path = ?watcher.path, "文件已轮转或删除，停止采集");
                 }
                 order.retain(|watching| *watching != key);
+                unresolved.remove(&key);
                 pending_forget.insert(key);
             }
 
@@ -564,6 +713,8 @@ fn fingerprint(path: &Path, metadata: &std::fs::Metadata) -> String {
 
 struct Watcher {
     key: String,
+    /// CRI 布局下从路径解出的 pod，取 label 用。
+    pod: Option<PodMeta>,
     path: PathBuf,
     file_field: Arc<str>,
     file: File,
@@ -582,6 +733,24 @@ struct Watcher {
 }
 
 impl Watcher {
+    /// 同一个 pod（不管哪个容器、哪个轮转文件）。
+    fn same_pod(&self, meta: &PodMeta) -> bool {
+        self.pod
+            .as_ref()
+            .is_some_and(|p| p.namespace == meta.namespace && p.pod == meta.pod)
+    }
+
+    /// 把 API server 给的 label 写进 `shared`。`None`（pod 没这个 label）保留静态
+    /// `fields.service_name`，那也没有就不写，落库时列取默认值空串。
+    fn set_service_name(&mut self, name: Option<&str>) {
+        let Some(name) = name else {
+            return;
+        };
+        let mut shared = self.shared.as_deref().cloned().unwrap_or_default();
+        shared.insert("service_name".to_owned(), Value::from(name));
+        self.shared = Some(Arc::new(shared));
+    }
+
     /// 同步读。日志在本地盘上，一次 64KiB 读只阻塞几十微秒；走 `tokio::fs` 的话每次
     /// `metadata()` / `read()` 都要经 spawn_blocking 跳两次线程，空转轮询一个文件
     /// 就要 13µs（同步 0.7µs），整机几百上千个文件按 500ms 轮询，这是常驻的 CPU 开销。

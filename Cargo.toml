@@ -1,6 +1,6 @@
 [package]
 name = "logpipe"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Minimal log collection & ingestion framework: source -> batch -> sink"
 license = "MIT"
