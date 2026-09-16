@@ -14,7 +14,7 @@ use crate::event::{LogEvent, WithOffset};
 use crate::sink::Sink;
 
 /// 建表时固定带的列，与 [`LogEvent`] 的固定字段一一对应。`timestamp` 的类型跟着
-/// `timezone` 走，不在这里。
+/// `timezone` 走，不在这里。顺序由 [`column_rank`] 定，这里的次序无关紧要。
 const BASE_COLUMNS: [(&str, &str); 8] = [
     ("level", "LowCardinality(String)"),
     ("trace_id", "String"),
@@ -25,6 +25,43 @@ const BASE_COLUMNS: [(&str, &str); 8] = [
     ("file", "String"),
     ("host", "LowCardinality(String)"),
 ];
+
+/// 列在表里的顺序，按 `select *` 看着顺手来排：先「几点、哪个服务、什么级别」，
+/// 再是定位用的 logger / thread / trace，然后是来源（namespace / pod / container /
+/// stream / host），配置里的静态字段夹在中间，最后才是 file 和 message 这两个长文本
+/// —— 不用 `except(message)` 也能一眼扫过去。表里没有的列跳过，不占位。
+const COLUMN_ORDER: [&str; 14] = [
+    "timestamp",
+    "service_name",
+    "level",
+    "logger",
+    "thread",
+    "trace_id",
+    "span_id",
+    "namespace",
+    "pod",
+    "container",
+    "stream",
+    "host",
+    "file",
+    "message",
+];
+
+/// 排序权重：表里认识的列按 [`COLUMN_ORDER`]，静态字段一律排在 `host` 之后、`file`
+/// 之前（同为静态字段之间保持配置里的顺序）。
+fn column_rank(name: &str) -> usize {
+    match COLUMN_ORDER.iter().position(|known| *known == name) {
+        Some(index) => index * 2,
+        None => {
+            COLUMN_ORDER
+                .iter()
+                .position(|known| *known == "file")
+                .unwrap()
+                * 2
+                - 1
+        }
+    }
+}
 
 /// 按 trace id 查日志（Jaeger 里拿到一个 id 反查全部日志）不一定带时间范围，
 /// 排序键里 trace_id 排在 timestamp 后面帮不上忙，全表扫 30 天。bloom filter
@@ -160,6 +197,7 @@ impl ClickhouseSink {
                 columns.push((name.clone(), ty.clone()));
             }
         }
+        columns.sort_by_key(|(name, _)| column_rank(name));
 
         let width = columns
             .iter()
@@ -190,9 +228,17 @@ impl ClickhouseSink {
             .map(|_| format!("MODIFY COLUMN `timestamp` {timestamp_type}"));
 
         let alter = |target: &str, on_cluster: &str, with_index: bool| {
+            // 老表补列也按同样的位置插（AFTER 只改元数据，不重写数据），新加的列不会
+            // 一律甩到 message 后面。前一列要么本来就有，要么在同一条 ALTER 里刚加上。
+            let mut previous = "timestamp";
             let mut actions: Vec<String> = columns
                 .iter()
-                .map(|(name, ty)| format!("ADD COLUMN IF NOT EXISTS `{name}` {ty}"))
+                .map(|(name, ty)| {
+                    let action =
+                        format!("ADD COLUMN IF NOT EXISTS `{name}` {ty} AFTER `{previous}`");
+                    previous = name;
+                    action
+                })
                 .collect();
             if with_index {
                 actions.push(format!("ADD INDEX IF NOT EXISTS {TRACE_ID_INDEX}"));
@@ -254,12 +300,38 @@ impl ClickhouseSink {
         format!("{}_local", self.table)
     }
 
-    /// 执行任意 SQL（建表、查询都可以）。
-    pub async fn execute(&self, sql: &str) -> Result<String> {
-        self.request(sql, Vec::new()).await
+    /// 把一批事件按 `JSONEachRow` 写进 `out`。
+    ///
+    /// 写的是 `Write` 而不是先 `to_json_line()` 拿 String 再拷过来 —— 后者每条事件
+    /// 多一次分配 + 一次拷贝。`out` 是 gzip 编码器时，明文就只在编码器的窗口里过一遍。
+    ///
+    /// 压缩级别取最快的那一档。实测 8.7MiB 一批（每条都有独立的 trace_id 和业务 id）：
+    /// level 1 压到 1/6.5 花 16ms，level 6 压到 1/7.5 却要 108ms —— 多压 15% 体积，
+    /// CPU 翻 6.8 倍。DaemonSet 里 CPU 才是紧张的那个资源，这笔账不划算。
+    fn encode_rows<W: Write>(&self, events: &[LogEvent], out: &mut W) -> Result<()> {
+        for event in events {
+            match self.timezone {
+                Some(tz) => {
+                    let offset = Self::offset_at(tz, &event.timestamp);
+                    serde_json::to_writer(&mut *out, &WithOffset { event, offset })?;
+                }
+                None => serde_json::to_writer(&mut *out, event)?,
+            }
+            out.write_all(b"\n")
+                .map_err(|err| Error::io("拼装 ClickHouse 请求体失败".to_owned(), err))?;
+        }
+        Ok(())
     }
 
-    async fn request(&self, sql: &str, body: Vec<u8>) -> Result<String> {
+    /// 执行任意 SQL（建表、查询都可以）。
+    pub async fn execute(&self, sql: &str) -> Result<String> {
+        // 空 body（`SELECT 1`、`EXISTS TABLE` 这些健康检查）不压：gzip 一个空串
+        // 反而会多出十几个字节的头，而这里正是 411 那个坑所在，保持原样最稳。
+        self.request(sql, Vec::new(), false).await
+    }
+
+    /// 把 `body` 发出去。`compressed` 表示它已经是 gzip 流了。
+    async fn request(&self, sql: &str, body: Vec<u8>, compressed: bool) -> Result<String> {
         let mut settings: Vec<(&str, &str)> = vec![
             ("query", sql),
             // 时间戳按 `2026-09-07 03:04:08.914` 发送，开启宽松解析更稳。
@@ -271,11 +343,6 @@ impl ClickhouseSink {
             settings.push(("async_insert", "1"));
             settings.push(("wait_for_async_insert", "1"));
         }
-
-        // 空 body（`SELECT 1`、`EXISTS TABLE` 这些健康检查）不压：gzip 一个空串反而
-        // 会多出十几个字节的头，而这里正是 411 那个坑所在，保持原样最稳。
-        let compressed = self.compress && !body.is_empty();
-        let body = if compressed { gzip(&body)? } else { body };
 
         // Content-Length 必须自己写。body 为空时（`SELECT 1`、`EXISTS TABLE` 这些
         // 健康检查）hyper 认为流已经结束，既不发 Content-Length 也不用 chunked，
@@ -317,47 +384,32 @@ fn escape_literal(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
-/// 压缩请求体。ClickHouse 见到 `Content-Encoding: gzip` 会自己解开，服务端不用开
-/// 任何设置 —— `enable_http_compression` 管的是响应方向，跟这里无关。
-///
-/// 压缩级别取最快的那一档。实测 8.7MiB 一批（每条都有独立的 trace_id 和业务 id）：
-/// level 1 压到 1/6.5 花 16ms，level 6 压到 1/7.5 却要 108ms —— 多压 15% 体积，
-/// CPU 翻 6.8 倍。DaemonSet 里 CPU 才是紧张的那个资源，这笔账不划算。
-fn gzip(body: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(body.len() / 8),
-        flate2::Compression::fast(),
-    );
-    encoder
-        .write_all(body)
-        .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err))?;
-    encoder
-        .finish()
-        .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err))
-}
-
 #[async_trait]
 impl Sink for ClickhouseSink {
     async fn write(&mut self, events: &[LogEvent]) -> Result<()> {
-        // 直接写进整批的缓冲区：先 to_json_line() 拿到 String 再拷进来，
-        // 等于每条事件多一次分配 + 一次拷贝。
-        let mut body: Vec<u8> = Vec::with_capacity(events.len() * 256);
-        for event in events {
-            match self.timezone {
-                Some(tz) => {
-                    let offset = Self::offset_at(tz, &event.timestamp);
-                    serde_json::to_writer(&mut body, &WithOffset { event, offset })?;
-                }
-                None => serde_json::to_writer(&mut body, event)?,
-            }
-            body.push(b'\n');
-        }
+        // 压缩的时候直接串进 gzip 流：未压缩的那份整批 body 从来不存在。原来是
+        // 先攒出 8MiB 明文、再压成 1.3MiB，峰值多背一个 max_bytes（还要算上
+        // Vec 扩容时的翻倍拷贝），而这几十毫秒恰好和重试退避重叠在一起。
+        let body = if self.compress {
+            let mut encoder = flate2::write::GzEncoder::new(
+                Vec::with_capacity(events.len() * 40),
+                flate2::Compression::fast(),
+            );
+            self.encode_rows(events, &mut encoder)?;
+            encoder
+                .finish()
+                .map_err(|err| Error::io("压缩 ClickHouse 请求体失败".to_owned(), err))?
+        } else {
+            let mut body = Vec::with_capacity(events.len() * 256);
+            self.encode_rows(events, &mut body)?;
+            body
+        };
 
         let sql = format!(
             "INSERT INTO `{}`.`{}` FORMAT JSONEachRow",
             self.database, self.table
         );
-        self.request(&sql, body).await?;
+        self.request(&sql, body, self.compress).await?;
 
         tracing::debug!(count = events.len(), table = %self.table, "已写入 ClickHouse");
         Ok(())

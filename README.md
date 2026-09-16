@@ -187,15 +187,20 @@ cargo run -- --ddl logpipe.yaml | clickhouse-client
 CREATE TABLE IF NOT EXISTS `logs`.`app_log`
 (
     `timestamp`    DateTime64(3),
+    `service_name` LowCardinality(String),
     `level`        LowCardinality(String),
+    `logger`       String,
+    `thread`       String,
     `trace_id`     String,
     `span_id`      String,
-    `thread`       String,
-    `logger`       String,
-    `message`      String,
-    `file`         String,
+    `namespace`    LowCardinality(String),
+    `pod`          String,
+    `container`    LowCardinality(String),
+    `stream`       LowCardinality(String),
     `host`         LowCardinality(String),
-    `service_name` LowCardinality(String),
+    `cluster`      LowCardinality(String),
+    `file`         String,
+    `message`      String,
     INDEX `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4
 )
 ENGINE = MergeTree
@@ -204,11 +209,18 @@ ORDER BY (`timestamp`, `level`, `trace_id`)
 TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
 
 ALTER TABLE `logs`.`app_log`
-    ADD COLUMN IF NOT EXISTS `level` LowCardinality(String),
-    ADD COLUMN IF NOT EXISTS `trace_id` String,
+    ADD COLUMN IF NOT EXISTS `service_name` LowCardinality(String) AFTER `timestamp`,
+    ADD COLUMN IF NOT EXISTS `level` LowCardinality(String) AFTER `service_name`,
     ...
     ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4;
 ```
+
+（这是 `type: kubernetes` 加 `fields: {cluster: ...}` 的样子；采文件时没有 `service_name`
+到 `stream` 那几列。）列的顺序是按 `select *` 看着顺手排的：先几点、哪个服务、什么级别，
+再是定位用的 logger / thread / trace，然后是来源，静态字段夹在 `host` 和 `file` 之间，
+`message` 永远最后。老表补列走 `ADD COLUMN ... AFTER`，新列插在同样的位置而不是甩到
+末尾（只改元数据，不重写数据）；老表里已有的列不会被挪动，想对齐成一样的顺序自己
+`MODIFY COLUMN x String AFTER y` 一下，也是纯元数据操作。
 
 两段：`CREATE TABLE IF NOT EXISTS` 管新表，后面的 `ALTER TABLE` 管老表 —— 全是
 `IF NOT EXISTS` 这类幂等操作，新表上跑是空转，老表上跑就把差异补齐。所以**表结构变了
@@ -357,7 +369,35 @@ order by timestamp
 
 * **至少一次**。位点（checkpoint）只在数据**确实写进存储之后**才推进，进程被杀/重启会从上次成功处重读，可能重复但不会丢。
 * 写入失败按指数退避重试（默认 5 次）；仍然失败时默认 `OnError::Stop` —— 停掉 pipeline、位点不动，重启后重来。想「丢了也无所谓、优先别堵」的场景可以设 `OnError::Drop`。
-* 背压：source 与 sink 之间是有界队列（`.buffer(n)`），存储慢下来时采集会自然被压住，不会把内存吃光。
+* 背压：存储慢下来时采集会自然被压住。有两道闸 —— 有界队列（`.buffer(n)`，按**批**计）和在途字节配额（`.max_inflight_bytes(n)`，按**字节**计）。
+
+### 内存上限
+
+只按批数封顶是不够的：一条日志可以是 20 字节的 access log，也可以是合并了堆栈的
+256KiB，同样 1000 条差着四个数量级。所以真正管内存的是**在途字节配额**（默认 32MiB）：
+source 发一批之前先按这批的大小申请配额，这批**落库之后**才释放，队列、攒批缓冲、
+正在写的那一批全都算在同一个数字里。存储挂掉时采集就停在这个水位上等，不会接着往
+内存里灌 —— OOMKilled 之后重启、从位点重读积压、再一次 OOM 的循环就是这么来的。
+
+配额按 JSON 体积估算（`LogEvent::estimated_size`），一条事件在内存里是结构体加六七次
+小分配，malloc 向上取整之后大致是估算值的两倍。算这个进程的内存盘子：
+
+```text
+2 × max_inflight_bytes  +  被采文件数 × 每文件读缓冲  +  常驻开销
+```
+
+读缓冲按文件的活跃度分两档：一直有数据可读的文件稳定在 128KiB（一次 read 的 64KiB
+加上一条没读完的行，`Vec` 扩容翻倍之后的稳态），安静的文件是 1KiB 上下。啃过一条
+超长行（`max_line_bytes`，默认 1MiB）的缓冲会被顶到 2MiB，那条行丢掉之后容量会还
+回去 —— 不还的话一个吐巨型单行的容器就能让这个文件的缓冲永久停在 MiB 级。
+
+所以默认值（32MiB 配额、一个节点几百个容器、其中几十个在持续写）大概是
+64 + 几 + 十几 MiB，100MiB 以内；DaemonSet 给 256Mi 的 limit 是舒服的。
+
+配额配得比 `batch.max_bytes` 的 4 倍还小会被抬上来并 warn 一句 —— 攒批和写入两头
+就能把配额占光，source 只能干等超时冲刷，吞吐要掉。
+
+单个文件一轮最多读 1MiB 就交出这一批，所以「一批有多大」也不再随日志形态漂移。
 
 ## 采集容器控制台日志（k8s + containerd）
 

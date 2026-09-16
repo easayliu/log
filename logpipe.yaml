@@ -68,7 +68,12 @@ retry:
   max_backoff_secs: 30
 
 pipeline:
-  buffer: 64
+  # 队列深度（按批计）。写入侧本来就是双缓冲，调大只是多囤内存
+  buffer: 8
+  # 在途日志的字节上限：队列 + 攒批缓冲 + 正在写的那一批。存储写不动的时候采集
+  # 停在这个水位上等，而不是接着往内存里灌。按 JSON 体积算，实际 RSS 约两倍，
+  # 再加上每个被采文件几十 KiB 的读缓冲，就是这个进程的内存盘子
+  max_inflight_bytes: 33554432
   # ClickHouse 连不上就不启动
   require_healthy: true
   # 重试耗尽后：stop = 停下且位点不推进（重启重来）；drop = 丢掉继续跑

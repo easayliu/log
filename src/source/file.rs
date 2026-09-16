@@ -26,6 +26,19 @@ use crate::source::k8s::{self, KubeClient, PodMeta, PodSelector};
 use crate::source::{Source, SourceSender};
 
 const READ_CHUNK: usize = 64 * 1024;
+/// 一轮里单个文件最多读多少字节就收手，攒下的这批交出去、下一轮接着读。
+///
+/// 只按条数（`batch_lines`）封顶是不够的：一条日志可以是 20 字节的 access log，
+/// 也可以是合并了堆栈的 256KiB，1000 条之间差着四个数量级。积压追读时这个差别
+/// 直接变成一批几百 MiB 的驻留内存。
+const READ_BATCH_BYTES: usize = 1024 * 1024;
+/// 读缓冲的常驻上限。稳态是「一次 64KiB 的 read + 一条没读完的行」，扩容翻倍之后
+/// 正好落在两倍 READ_CHUNK 上，所以按这个数留。
+///
+/// 超过它说明刚啃过一条超长行。`Vec` 只增不减：`max_line_bytes` 那个丢弃分支
+/// `clear()` 完容量还在，而扩容是翻倍的，一条 1MiB 的行会把缓冲顶到 2MiB 并且
+/// 永远留着。节点上几十个吐巨型单行的容器，就是上百 MiB 常驻。
+const BUF_KEEP_BYTES: usize = 2 * READ_CHUNK;
 /// 退出时等待落库回执的上限。
 const COMMIT_WAIT: Duration = Duration::from_secs(30);
 
@@ -55,6 +68,7 @@ pub struct FileSource {
     idle_flush: Duration,
     max_line_bytes: usize,
     batch_lines: usize,
+    batch_bytes: usize,
     fields: BTreeMap<String, Value>,
 }
 
@@ -82,6 +96,7 @@ impl FileSource {
             idle_flush: Duration::from_secs(2),
             max_line_bytes: 1024 * 1024,
             batch_lines: 1000,
+            batch_bytes: READ_BATCH_BYTES,
             fields: BTreeMap::new(),
         }
     }
@@ -488,6 +503,11 @@ impl Source for FileSource {
         // 整个 source 共用一块读缓冲：原来每次 read() 都 `vec![0u8; 64KiB]`，
         // 既要分配也要清零；放在 watcher 上又会变成每个文件常驻 64KiB。
         let mut chunk = vec![0u8; READ_CHUNK];
+        let limits = ReadLimits {
+            lines: self.batch_lines,
+            bytes: self.batch_bytes,
+            line_bytes: self.max_line_bytes,
+        };
         let mut last_glob: Option<Instant> = None;
         let mut last_save = Instant::now();
         // 已发出、等待落库回执的提交任务；退出前要等它们结束再存位点。
@@ -542,13 +562,8 @@ impl Source for FileSource {
                 let Some(watcher) = watchers.get_mut(key) else {
                     continue;
                 };
-                let events = match watcher.read(
-                    &mut chunk,
-                    self.batch_lines,
-                    self.max_line_bytes,
-                    self.idle_flush,
-                    &checkpointer,
-                ) {
+                let events = match watcher.read(&mut chunk, limits, self.idle_flush, &checkpointer)
+                {
                     Ok(events) => events,
                     Err(err) => {
                         tracing::warn!(path = ?watcher.path, %err, "读取失败，稍后重试");
@@ -711,6 +726,24 @@ fn fingerprint(path: &Path, metadata: &std::fs::Metadata) -> String {
     }
 }
 
+/// 把读缓冲多占的内存还给分配器，见 [`BUF_KEEP_BYTES`]。
+///
+/// 只在缓冲基本空了的时候还：尾巴本身就超过一个 chunk 说明正读着一条大行，
+/// 这时候缩回去只会让下一轮再扩一次，白搭一次 realloc + 拷贝。
+fn shrink_buf(buf: &mut Vec<u8>) {
+    if buf.capacity() > BUF_KEEP_BYTES && buf.len() <= READ_CHUNK {
+        buf.shrink_to(BUF_KEEP_BYTES);
+    }
+}
+
+/// 一轮读取的限额：一批最多多少条、最多读多少字节，以及单行的上限。
+#[derive(Clone, Copy)]
+struct ReadLimits {
+    lines: usize,
+    bytes: usize,
+    line_bytes: usize,
+}
+
 struct Watcher {
     key: String,
     /// CRI 布局下从路径解出的 pod，取 label 用。
@@ -757,8 +790,7 @@ impl Watcher {
     fn read(
         &mut self,
         chunk: &mut [u8],
-        max_lines: usize,
-        max_line_bytes: usize,
+        limits: ReadLimits,
         idle_flush: Duration,
         checkpointer: &Checkpointer,
     ) -> std::io::Result<Vec<LogEvent>> {
@@ -779,15 +811,20 @@ impl Watcher {
             }
         }
 
-        while events.len() < max_lines {
+        // 条数和字节数哪个先到都收手。字节这一路即使一条都没攒出来也照样退出
+        // （比如正读一条超长的堆栈），代价是这个文件多等一轮，换来的是「一批最多
+        // 这么大」不受日志形态影响。
+        let mut read_bytes = 0;
+        while events.len() < limits.lines && read_bytes < limits.bytes {
             let n = self.file.read(&mut *chunk)?;
             if n == 0 {
                 self.at_eof = true;
                 break;
             }
             self.at_eof = false;
+            read_bytes += n;
             self.buf.extend_from_slice(&chunk[..n]);
-            self.drain_lines(&mut events, max_line_bytes);
+            self.drain_lines(&mut events, limits.line_bytes);
         }
 
         // 读到文件末尾时，最后一条日志可能还在等续行，等够时间就收口。
@@ -849,6 +886,8 @@ impl Watcher {
             self.safe_offset = self.offset;
             self.buf.clear();
         }
+
+        shrink_buf(&mut self.buf);
     }
 
     fn flush_pending(&mut self) -> Option<LogEvent> {
@@ -895,6 +934,60 @@ mod tests {
         assert!(should_skip(Path::new(
             "/var/log/pods/ns_pod_uid/app/5.log.20260907-155201.tmp"
         )));
+    }
+
+    /// 啃过一条超长行之后，读缓冲要把多占的内存还回去 —— 不还的话，一个吐巨型
+    /// 单行的容器就让这个文件的缓冲永久停在 MiB 级。
+    #[test]
+    fn read_buffer_is_returned_after_an_overlong_line() {
+        let chunk = vec![0u8; READ_CHUNK];
+
+        // 稳态：读满一个 chunk、留半条行没读完，容量就落在 BUF_KEEP_BYTES，
+        // 这是每轮都要用到的工作集，不该动它
+        let mut buf: Vec<u8> = Vec::new();
+        for _ in 0..4 {
+            buf.extend_from_slice(&chunk);
+            let tail = buf.len() - 300;
+            buf.drain(..tail);
+            shrink_buf(&mut buf);
+        }
+        assert_eq!(
+            buf.capacity(),
+            BUF_KEEP_BYTES,
+            "稳态的缓冲被缩了，每轮都要重扩"
+        );
+
+        // 一条 1MiB 的超长行：丢弃之后容量必须还回去
+        let mut buf: Vec<u8> = Vec::new();
+        while buf.len() <= 1024 * 1024 {
+            buf.extend_from_slice(&chunk);
+        }
+        let swollen = buf.capacity();
+        assert!(
+            swollen > 1024 * 1024,
+            "没撑起来，这个用例就没意义: {swollen}"
+        );
+        buf.clear();
+        shrink_buf(&mut buf);
+        assert!(
+            buf.capacity() <= BUF_KEEP_BYTES,
+            "超长行的内存没还回去: {} -> {}",
+            swollen,
+            buf.capacity()
+        );
+
+        // 正读着一条大行（尾巴比一个 chunk 还长）时不动它
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&chunk);
+        buf.extend_from_slice(&chunk);
+        buf.extend_from_slice(&chunk);
+        let holding = buf.capacity();
+        shrink_buf(&mut buf);
+        assert_eq!(
+            buf.capacity(),
+            holding,
+            "半条大行还在缓冲里就缩，下一轮还得扩回去"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::batch::{BatchConfig, RetryConfig};
 use crate::error::{Error, Result};
 use crate::parser::{ChainParser, ContainerFormat, LogFormat};
-use crate::pipeline::{OnError, Pipeline};
+use crate::pipeline::{self, OnError, Pipeline};
 use crate::sink::console::Encoding;
 use crate::sink::{ClickhouseSink, ConsoleSink};
 use crate::source::checkpoint::Checkpointer;
@@ -205,6 +205,10 @@ pub struct PipelineSettings {
     /// source 与 sink 之间的队列深度（按批计）。
     #[serde(default = "default_buffer")]
     pub buffer: usize,
+    /// 在途日志的字节上限：队列 + 攒批缓冲 + 正在写的那一批加起来的字节数。
+    /// 存储写不动的时候，采集会停在这个水位上等，而不是接着往内存里灌。
+    #[serde(default = "default_max_inflight_bytes")]
+    pub max_inflight_bytes: usize,
     /// healthcheck 不通过就不启动。
     #[serde(default)]
     pub require_healthy: bool,
@@ -246,7 +250,10 @@ fn default_initial_backoff_ms() -> u64 {
     RetryConfig::default().initial_backoff.as_millis() as u64
 }
 fn default_buffer() -> usize {
-    64
+    pipeline::DEFAULT_BUFFER
+}
+fn default_max_inflight_bytes() -> usize {
+    pipeline::DEFAULT_MAX_INFLIGHT_BYTES
 }
 fn default_service_name_label() -> String {
     "app".to_owned()
@@ -280,6 +287,7 @@ impl Default for PipelineSettings {
     fn default() -> Self {
         Self {
             buffer: default_buffer(),
+            max_inflight_bytes: default_max_inflight_bytes(),
             require_healthy: false,
             on_error: OnErrorSetting::Stop,
         }
@@ -546,6 +554,20 @@ impl Config {
     pub fn build(self) -> Result<Pipeline> {
         let source = self.build_source()?;
 
+        // 在途配额比一批还小的话，攒批和写入两头就把配额占光了，source 只能等
+        // 超时冲刷，吞吐直接掉到地上。留够四批的余量，配小了抬上来并说一声。
+        let floor = self.batch.max_bytes.saturating_mul(4);
+        let inflight = if self.pipeline.max_inflight_bytes < floor {
+            tracing::warn!(
+                configured = self.pipeline.max_inflight_bytes,
+                used = floor,
+                "pipeline.max_inflight_bytes 小于 4 倍 batch.max_bytes，已抬到这个下限"
+            );
+            floor
+        } else {
+            self.pipeline.max_inflight_bytes
+        };
+
         let builder = Pipeline::builder()
             .source(source)
             .batch(
@@ -560,6 +582,7 @@ impl Config {
                 max_backoff: Duration::from_secs(self.retry.max_backoff_secs),
             })
             .buffer(self.pipeline.buffer)
+            .max_inflight_bytes(inflight)
             .require_healthy(self.pipeline.require_healthy)
             .on_error(match self.pipeline.on_error {
                 OnErrorSetting::Stop => OnError::Stop,
@@ -672,6 +695,38 @@ fields:
             assert!(ddl.contains(column), "DDL 少了 {column}:\n{ddl}");
         }
         assert!(ddl.contains("`replica`      Int64"));
+        // 列序按看着顺手来：时间、服务、级别在前，静态字段夹在 host 和 file 之间，message 垫底
+        let create = &ddl[..ddl.find("ENGINE").unwrap()];
+        let position = |column: &str| create.find(&format!("`{column}`")).unwrap();
+        let expected = [
+            "timestamp",
+            "service_name",
+            "level",
+            "logger",
+            "trace_id",
+            "namespace",
+            "pod",
+            "host",
+            "cluster",
+            "replica",
+            "file",
+            "message",
+        ];
+        for pair in expected.windows(2) {
+            assert!(
+                position(pair[0]) < position(pair[1]),
+                "{} 应当排在 {} 前面:\n{create}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // 老表补列也插到同样的位置
+        assert!(
+            ddl.contains(
+                "ADD COLUMN IF NOT EXISTS `service_name` LowCardinality(String) AFTER `timestamp`"
+            ),
+            "{ddl}"
+        );
         config.build().unwrap();
     }
 

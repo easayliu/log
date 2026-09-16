@@ -1,6 +1,8 @@
 //! 把 source 和 sink 串起来：攒批、重试、优雅退出。
 
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -10,6 +12,15 @@ use crate::event::LogEvent;
 use crate::shutdown::{self, Shutdown, ShutdownHandle};
 use crate::sink::Sink;
 use crate::source::{Source, SourceSender};
+
+/// source 与 sink 之间的队列深度（按批计）。写入侧本来就是双缓冲，深度再大也只是
+/// 多囤内存：真正管用的背压是字节配额。
+pub const DEFAULT_BUFFER: usize = 8;
+
+/// 在途日志的字节上限（按 [`LogEvent::estimated_size`] 计），默认 32MiB。
+///
+/// 队列深度只管得住批数，管不住每批多大 —— 真正决定 RSS 的是这个。
+pub const DEFAULT_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 
 /// 逐条改写事件；返回 `None` 表示丢弃这条日志。
 pub type Transform = Box<dyn FnMut(LogEvent) -> Option<LogEvent> + Send>;
@@ -30,6 +41,7 @@ pub struct Pipeline {
     batch: BatchConfig,
     retry: RetryConfig,
     buffer: usize,
+    max_inflight_bytes: usize,
     require_healthy: bool,
     on_error: OnError,
 }
@@ -71,6 +83,7 @@ impl Pipeline {
             batch,
             retry,
             buffer,
+            max_inflight_bytes,
             require_healthy,
             on_error,
         } = self;
@@ -83,6 +96,11 @@ impl Pipeline {
         }
 
         let (tx, mut rx) = mpsc::channel(buffer);
+        // 在途字节配额。source 发之前先按批次大小申请，批次写完才释放 —— 队列、
+        // 攒批缓冲、正在写的那一批加起来，占用的字节数被这一个数字焊死。
+        // 许可数是 u32，上限也就跟着封在 4GiB，对日志采集绰绰有余。
+        let capacity = max_inflight_bytes.clamp(1, u32::MAX as usize) as u32;
+        let quota = Arc::new(Semaphore::new(capacity as usize));
         let source_name = source.name();
         let sink_name = sink.name();
 
@@ -103,8 +121,10 @@ impl Pipeline {
             }
         });
 
-        let mut source_task: JoinHandle<Result<()>> =
-            tokio::spawn(source.run(SourceSender::new(tx), source_shutdown));
+        let mut source_task: JoinHandle<Result<()>> = tokio::spawn(source.run(
+            SourceSender::new(tx, Arc::clone(&quota), capacity),
+            source_shutdown,
+        ));
 
         let mut pending = Pending::default();
         let mut deadline: Option<Instant> = None;
@@ -132,6 +152,11 @@ impl Pipeline {
                             }
                             if let Some(ack) = incoming.ack.take() {
                                 pending.acks.push(ack);
+                            }
+                            // 配额跟着数据走，攒进哪一批就由哪一批写完后释放。
+                            // 提前还回去的话，source 会在这批还占着内存时又灌一批进来。
+                            if let Some(permit) = incoming.permit.take() {
+                                pending.permits.push(permit);
                             }
 
                             if deadline.is_none() {
@@ -173,7 +198,9 @@ impl Pipeline {
         };
 
         // 通知 source 收工，并关掉接收端：它下一次发送会立刻失败，不至于卡在背压上。
+        // 配额也一起关掉 —— source 可能正等在 `reserve` 上，光关 channel 叫不醒它。
         stop_source.trigger();
+        quota.close();
         rx.close();
         drop(rx);
         // 释放还没回执的 ack：对应批次没能落库，source 会保留原位点。
@@ -223,6 +250,7 @@ impl RunningPipeline {
 struct Pending {
     events: Vec<LogEvent>,
     acks: Vec<oneshot::Sender<()>>,
+    permits: Vec<OwnedSemaphorePermit>,
     bytes: usize,
 }
 
@@ -241,6 +269,7 @@ impl Pending {
         WriteBatch {
             events: std::mem::take(&mut self.events),
             acks: std::mem::take(&mut self.acks),
+            permits: std::mem::take(&mut self.permits),
         }
     }
 }
@@ -250,6 +279,8 @@ struct WriteBatch {
     events: Vec<LogEvent>,
     /// 这批数据落库之后要回执的通道，source 据此推进位点。
     acks: Vec<oneshot::Sender<()>>,
+    /// 在途字节配额，随这批数据一起释放（丢弃 `WriteBatch` 时自动归还）。
+    permits: Vec<OwnedSemaphorePermit>,
 }
 
 /// 顺序执行 transform，任一环节返回 `None` 就丢弃这条日志。
@@ -333,6 +364,10 @@ async fn write_batches(
                 }
             }
         }
+
+        // 配额到这里才归还。放早了等于允许 source 在这批还占着内存的时候
+        // 再灌一批进来，在途字节就不是上限而是建议了。
+        drop(batch.permits);
     }
     Ok(())
 }
@@ -391,6 +426,7 @@ pub struct PipelineBuilder {
     batch: Option<BatchConfig>,
     retry: Option<RetryConfig>,
     buffer: Option<usize>,
+    max_inflight_bytes: Option<usize>,
     require_healthy: bool,
     on_error: Option<OnError>,
 }
@@ -426,8 +462,15 @@ impl PipelineBuilder {
     }
 
     /// source 与 sink 之间的队列深度（按批计）。队列满了 source 会被自然阻塞。
+    /// 真正限制内存的是 [`Self::max_inflight_bytes`]，这里只是条数上的兜底。
     pub fn buffer(mut self, buffer: usize) -> Self {
         self.buffer = Some(buffer.max(1));
+        self
+    }
+
+    /// 在途日志的字节上限，见 [`DEFAULT_MAX_INFLIGHT_BYTES`]。
+    pub fn max_inflight_bytes(mut self, bytes: usize) -> Self {
+        self.max_inflight_bytes = Some(bytes.max(1));
         self
     }
 
@@ -449,7 +492,10 @@ impl PipelineBuilder {
             transforms: self.transforms,
             batch: self.batch.unwrap_or_default(),
             retry: self.retry.unwrap_or_default(),
-            buffer: self.buffer.unwrap_or(64),
+            buffer: self.buffer.unwrap_or(DEFAULT_BUFFER),
+            max_inflight_bytes: self
+                .max_inflight_bytes
+                .unwrap_or(DEFAULT_MAX_INFLIGHT_BYTES),
             require_healthy: self.require_healthy,
             on_error: self.on_error.unwrap_or(OnError::Stop),
         })

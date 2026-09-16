@@ -67,6 +67,12 @@ data:
       require_healthy: true
       # 写不进去就停下、位点不推进，Pod 重启后重读，不丢数据
       on_error: stop
+      # 在途日志的字节上限（队列 + 攒批缓冲 + 正在写的那一批）。ClickHouse 写不动时
+      # 采集就停在这个水位上等，不会接着往内存里灌。实际 RSS 约是它的两倍，再加上
+      # 每个活跃文件 128KiB 的读缓冲 —— 和下面的 limits.memory 是同一笔账。
+      # 默认就是 33554432（32MiB），要改再打开：配置是 deny_unknown_fields，
+      # 老镜像认不得这个 key 会起不来，等所有节点都换到新镜像之后再解注释
+      # max_inflight_bytes: 33554432
 
     fields:
       cluster: bj-prod
@@ -128,7 +134,7 @@ spec:
       containers:
         - name: logpipe
           # 打 v* tag 由 CI 推到 GHCR，见 README「发布」
-          image: ghcr.io/easayliu/log:v0.1.8
+          image: ghcr.io/easayliu/log:v0.1.9
           args: ["/etc/logpipe/logpipe.yaml"]
           env:
             - name: RUST_LOG
