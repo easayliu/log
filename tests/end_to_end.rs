@@ -354,6 +354,50 @@ async fn kubernetes_source_selects_by_namespace() {
 
 /// kubelet 的轮转发生在进程不在的时候：轮转文件里没读完的那一段、以及轮转出的
 /// 新文件里的内容，重启后都要补回来。
+/// 最后一条日志还在等续行（异常堆栈没打完，或者刚打完还没等够 `idle_flush`）时
+/// 文件被轮转/删除 —— 它不能跟着 watcher 一起消失。
+#[tokio::test]
+async fn unclosed_last_event_survives_the_file_being_rotated_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.log");
+    append(&path, &[LINE_2, STACK_1, STACK_2]);
+
+    let sink = MemorySink::new();
+    let events = sink.events();
+    // 收口等 30 秒：确保这条是靠「文件没了」那条路送出去的，不是等超时等出来的
+    let running = Pipeline::builder()
+        .source(
+            FileSource::new([path.display().to_string()])
+                .data_dir(dir.path())
+                .read_interval(Duration::from_millis(20))
+                .glob_interval(Duration::from_millis(50))
+                .idle_flush(Duration::from_secs(30)),
+        )
+        .sink(sink)
+        .batch(batch())
+        .build()
+        .unwrap()
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "还在等续行，这时候不该有事件"
+    );
+
+    std::fs::remove_file(&path).unwrap();
+    wait_for(
+        || events.lock().unwrap().len() == 1,
+        "文件没了也要把最后一条送出来",
+    )
+    .await;
+    running.stop().await.unwrap();
+
+    let events = events.lock().unwrap();
+    assert_eq!(events[0].level, "ERROR");
+    assert!(events[0].message.contains("OrderController.java:88"));
+}
+
 #[tokio::test]
 async fn rotation_while_agent_is_down_is_not_lost() {
     let dir = tempfile::tempdir().unwrap();

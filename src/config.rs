@@ -117,7 +117,7 @@ pub struct FileSourceConfig {
     pub container_format: ContainerFormat,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParserConfig {
     /// 这条 pipeline 上会遇到的日志格式，按顺序尝试，第一个匹配上的胜出。
@@ -131,6 +131,25 @@ pub struct ParserConfig {
     /// 自定义正则，命名捕获组：timestamp / level / trace_id / span_id / thread / logger / message。
     /// 只作用在 `logback` 这一档上。
     pub pattern: Option<String>,
+    /// 一条日志（连同异常堆栈）最多合并多少行。超过之后这条就**封口**：剩下的续行
+    /// 全部丢掉，末尾留一行 `... [logpipe 截断：省略 N 行 / M 字节]`。
+    #[serde(default = "default_max_message_lines")]
+    pub max_message_lines: usize,
+    /// 一条日志正文最多多少字节，同 `max_message_lines`。打整个响应体的服务很容易
+    /// 顶满（一个 IN 里塞一万个 id 的 SQL 就有几百 KB）。
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
+impl Default for ParserConfig {
+    fn default() -> Self {
+        Self {
+            formats: Vec::new(),
+            pattern: None,
+            max_message_lines: default_max_message_lines(),
+            max_message_bytes: default_max_message_bytes(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +276,14 @@ fn default_max_inflight_bytes() -> usize {
 }
 fn default_service_name_label() -> String {
     "app".to_owned()
+}
+
+fn default_max_message_lines() -> usize {
+    crate::parser::DEFAULT_MAX_MESSAGE_LINES
+}
+
+fn default_max_message_bytes() -> usize {
+    crate::parser::DEFAULT_MAX_MESSAGE_BYTES
 }
 
 fn default_pod_log_dir() -> String {
@@ -475,6 +502,11 @@ impl Config {
 
     fn build_source(&self) -> Result<FileSource> {
         let parser = self.build_parser()?;
+        if self.parser.max_message_lines == 0 || self.parser.max_message_bytes == 0 {
+            return Err(Error::config(
+                "parser.max_message_lines / max_message_bytes 不能是 0，那样每条日志的堆栈都会被丢光",
+            ));
+        }
 
         let source = match &self.source {
             SourceConfig::Kubernetes(k8s) => {
@@ -524,7 +556,9 @@ impl Config {
             }
         };
 
-        Ok(source)
+        Ok(source
+            .max_message_lines(self.parser.max_message_lines)
+            .max_message_bytes(self.parser.max_message_bytes))
     }
 
     /// 启动前的静态校验：配置能不能组装出组件、位点目录能不能用。

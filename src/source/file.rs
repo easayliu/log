@@ -19,7 +19,10 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::event::LogEvent;
-use crate::parser::{Aggregator, ContainerFormat, LogbackParser, Parser};
+use crate::parser::{
+    Aggregator, ContainerFormat, LogbackParser, Parser, DEFAULT_MAX_MESSAGE_BYTES,
+    DEFAULT_MAX_MESSAGE_LINES,
+};
 use crate::shutdown::Shutdown;
 use crate::source::checkpoint::Checkpointer;
 use crate::source::k8s::{self, KubeClient, PodMeta, PodSelector};
@@ -67,6 +70,8 @@ pub struct FileSource {
     checkpoint_interval: Duration,
     idle_flush: Duration,
     max_line_bytes: usize,
+    max_message_lines: usize,
+    max_message_bytes: usize,
     batch_lines: usize,
     batch_bytes: usize,
     fields: BTreeMap<String, Value>,
@@ -95,6 +100,8 @@ impl FileSource {
             checkpoint_interval: Duration::from_secs(5),
             idle_flush: Duration::from_secs(2),
             max_line_bytes: 1024 * 1024,
+            max_message_lines: DEFAULT_MAX_MESSAGE_LINES,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             batch_lines: 1000,
             batch_bytes: READ_BATCH_BYTES,
             fields: BTreeMap::new(),
@@ -197,6 +204,18 @@ impl FileSource {
     /// 读到文件末尾后，最后一条日志等多久没有续行就认为它已经完整。
     pub fn idle_flush(mut self, idle_flush: Duration) -> Self {
         self.idle_flush = idle_flush;
+        self
+    }
+
+    /// 一条日志（连同异常堆栈）最多合并多少行，超过的丢掉并在末尾标注。
+    pub fn max_message_lines(mut self, lines: usize) -> Self {
+        self.max_message_lines = lines;
+        self
+    }
+
+    /// 一条日志正文最多多少字节，同 [`Self::max_message_lines`]。
+    pub fn max_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_message_bytes = bytes;
         self
     }
 
@@ -377,7 +396,9 @@ impl FileSource {
                     safe_offset: start,
                     buf: Vec::new(),
                     aggregator: Aggregator::new(Arc::clone(&self.parser))
-                        .decoder(self.container_format.decoder()),
+                        .decoder(self.container_format.decoder())
+                        .max_lines(self.max_message_lines)
+                        .max_bytes(self.max_message_bytes),
                     shared: (!shared.is_empty()).then(|| Arc::new(shared)),
                     host: Arc::clone(&self.host),
                     pending_since: None,
@@ -600,7 +621,22 @@ impl Source for FileSource {
             }
 
             for key in finished {
-                if let Some(watcher) = watchers.remove(&key) {
+                if let Some(mut watcher) = watchers.remove(&key) {
+                    // 还没等够 `idle_flush` 就被轮转掉的最后一条日志（往往正是刚打完
+                    // 的那条异常）不能跟着 watcher 一起没掉：先收口送走再回收。
+                    if let Some(event) = watcher.flush_pending() {
+                        let ack = out.send_with_ack(vec![event]).await?;
+                        inflight.push((
+                            key.clone(),
+                            spawn_commit(
+                                Arc::clone(&checkpointer),
+                                key.clone(),
+                                watcher.path.clone(),
+                                watcher.safe_offset,
+                                ack,
+                            ),
+                        ));
+                    }
                     tracing::info!(path = ?watcher.path, "文件已轮转或删除，停止采集");
                 }
                 order.retain(|watching| *watching != key);
@@ -882,6 +918,9 @@ impl Watcher {
                 bytes = self.buf.len(),
                 "单行超过上限，丢弃这段内容"
             );
+            // 丢的是这条巨行的前半截，后半截还在文件里：告诉聚合器封口，
+            // 否则下一个换行切出来的残尾会被当成续行，挂到一条毫不相干的日志上。
+            self.aggregator.discard(self.buf.len());
             self.offset += self.buf.len() as u64;
             self.safe_offset = self.offset;
             self.buf.clear();

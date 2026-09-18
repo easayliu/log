@@ -32,6 +32,10 @@ parser:
   # logback 那一档的自定义正则，需要改格式时才填，
   # 命名捕获组：timestamp / level / trace_id / span_id / thread / logger / message
   # pattern: '^(?P<timestamp>\S+ \S+)\s+\[(?P<thread>[^\]]*)\]\s+(?P<level>[A-Z]+)\s+(?P<logger>\S+)\s*-?\s?(?P<message>.*)$'
+  # 一条日志（连同异常堆栈）最多合并多少行 / 多少字节。超了这条就整条封口：
+  # 后面的续行不再接，末尾补一行 "... [logpipe 截断：省略 N 行 / M 字节]"
+  max_message_lines: 500
+  max_message_bytes: 262144
   # 时间戳原样落库（日志写 11:04 库里就是 11:04），不做时区换算
 
 # sink 的字段跟着 type 走，两段二选一（注意别混着填）

@@ -745,15 +745,29 @@ fn month_of_abbrev(raw: &[u8]) -> Option<u32> {
     })
 }
 
+/// 单条日志最多合并多少行、正文最多多少字节。畸形堆栈（或者把整个响应体打进日志的
+/// 业务代码）不设上限会把内存吃光，超过就丢，并在末尾留下 `... [logpipe 截断：...]`。
+pub const DEFAULT_MAX_MESSAGE_LINES: usize = 500;
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
 /// 行聚合器：把「一条日志跨多行」的情况（异常堆栈）拼成一个事件。
 ///
 /// 用法是逐行 `push`，拿到 `Some(event)` 就是**上一条**日志已经完整了；
 /// 读到文件末尾/退出前调用 `flush` 取出最后一条。
+///
+/// 超上限时的规矩是**整条封口**而不是「挑装得下的接」：一旦某一行没接上，这条日志
+/// 后面的续行就全部丢掉，只在末尾记一行丢了多少。挑着接的话 message 里会出现
+/// 看不出来的断层，那比少一段更糟。
 pub struct Aggregator {
     parser: Arc<dyn Parser>,
     decoder: LineDecoder,
     pending: Option<LogEvent>,
     pending_lines: usize,
+    /// 当前这条日志已经丢掉的续行数和字节数，封口时写进末尾的标记里。
+    dropped_lines: usize,
+    dropped_bytes: usize,
+    /// 当前这条日志已经封口：剩下的续行一律不再拼，等下一条日志的头部。
+    sealed: bool,
     /// 单条日志最多合并多少行，防止畸形堆栈把内存吃光。
     pub max_lines: usize,
     /// 单条日志正文最大字节数。
@@ -767,8 +781,11 @@ impl Aggregator {
             decoder: LineDecoder::Raw,
             pending: None,
             pending_lines: 0,
-            max_lines: 500,
-            max_bytes: 256 * 1024,
+            dropped_lines: 0,
+            dropped_bytes: 0,
+            sealed: false,
+            max_lines: DEFAULT_MAX_MESSAGE_LINES,
+            max_bytes: DEFAULT_MAX_MESSAGE_BYTES,
         }
     }
 
@@ -797,51 +814,102 @@ impl Aggregator {
         } = self.decoder.decode(line)?;
 
         match self.parser.parse(&content) {
-            // 新的一条日志：把上一条交出去。
+            // 新的一条日志：把上一条交出去。解析得出头部就是封口状态的终点。
             Some(mut event) => {
                 if let Some(stream) = stream {
                     event.insert("stream", stream);
                 }
+                let previous = self.seal_pending();
+                self.pending = Some(event);
                 self.pending_lines = 1;
-                self.pending.replace(event)
+                previous
             }
             // 续行：并入上一条；没有上一条时（比如从文件中间开始读）单独成条。
-            None => match self.pending.as_mut() {
-                Some(pending) => {
-                    if self.pending_lines < self.max_lines
-                        && pending.message.len() + content.len() < self.max_bytes
-                    {
-                        pending.append_line(&content);
-                        self.pending_lines += 1;
-                    }
-                    None
+            None => {
+                if self.sealed {
+                    // 已经封口：这一行属于上一条日志，但上一条装不下了。**不能**因为
+                    // 它短就接上去 —— 那样 message 里会出现看不见的断层（第 300 行
+                    // 直接接第 480 行）；也不能让它单独成条，那是一段没有头部的残文。
+                    self.dropped_lines += 1;
+                    self.dropped_bytes += content.len() + 1;
+                    return None;
                 }
-                None => {
-                    let mut event = LogEvent::new(content.into_owned());
-                    // 应用日志里没有时间戳时，用运行时打的时间兜底。
-                    if let Some(time) = time {
-                        event.timestamp = time;
+                match self.pending.as_mut() {
+                    Some(pending) => {
+                        let (max_lines, max_bytes) = (self.max_lines, self.max_bytes);
+                        let lines = self.pending_lines;
+                        // `<` 而不是 `<=`：拼上去还要多一个换行符
+                        let fits =
+                            lines < max_lines && pending.message.len() + content.len() < max_bytes;
+                        if fits {
+                            pending.append_line(&content);
+                            self.pending_lines += 1;
+                        } else {
+                            self.sealed = true;
+                            self.dropped_lines += 1;
+                            self.dropped_bytes += content.len() + 1;
+                        }
+                        None
                     }
-                    if let Some(stream) = stream {
-                        event.insert("stream", stream);
+                    None => {
+                        let mut event = LogEvent::new(content.into_owned());
+                        // 应用日志里没有时间戳时，用运行时打的时间兜底。
+                        if let Some(time) = time {
+                            event.timestamp = time;
+                        }
+                        if let Some(stream) = stream {
+                            event.insert("stream", stream);
+                        }
+                        Some(event)
                     }
-                    Some(event)
                 }
-            },
+            }
         }
+    }
+
+    /// 上游把一段读不完的超长行丢了（见 `FileSource` 的 `max_line_bytes`）。
+    ///
+    /// 那段内容属于当前这条日志，丢了就必须封口：**残行的后半截不能再接上来**。
+    /// 不封的话，缓冲区清空后遇到的第一个换行切出来的是这条巨行的尾巴，它解析不出
+    /// 头部，于是被当成续行挂到一条毫不相干的日志上。
+    pub fn discard(&mut self, bytes: usize) {
+        self.sealed = true;
+        self.dropped_lines += 1;
+        self.dropped_bytes += bytes;
+    }
+
+    /// 取出 pending 并封口：丢过内容就在末尾补一行标记。丢了不留痕的话，库里是一条
+    /// 「看着挺完整」的日志，下游（opdash 的「已截断」标记比的是库里的 `length(message)`）
+    /// 也没法知道少了东西。
+    fn seal_pending(&mut self) -> Option<LogEvent> {
+        let lines = std::mem::take(&mut self.dropped_lines);
+        let bytes = std::mem::take(&mut self.dropped_bytes);
+        self.sealed = false;
+        let mut event = self.pending.take()?;
+        if lines > 0 {
+            event.append_line(&format!(
+                "... [logpipe 截断：省略 {lines} 行 / {bytes} 字节]"
+            ));
+        }
+        Some(event)
     }
 
     /// 取出尚未闭合的最后一条日志。
     pub fn flush(&mut self) -> Option<LogEvent> {
-        // 没等到结束标记的 CRI 片段也不能丢。
+        // 没等到结束标记的 CRI 片段也不能丢（封了口的除外，规则同续行）。
         if let Some(rest) = self.decoder.take_partial() {
-            match self.pending.as_mut() {
-                Some(pending) => pending.append_line(&rest),
-                None => self.pending = Some(LogEvent::new(rest)),
+            if self.sealed {
+                self.dropped_lines += 1;
+                self.dropped_bytes += rest.len() + 1;
+            } else {
+                match self.pending.as_mut() {
+                    Some(pending) => pending.append_line(&rest),
+                    None => self.pending = Some(LogEvent::new(rest)),
+                }
             }
         }
         self.pending_lines = 0;
-        self.pending.take()
+        self.seal_pending()
     }
 
     /// 是否有正在等待续行的日志。
@@ -1016,6 +1084,80 @@ mod tests {
         );
         assert!(agg.flush().is_some());
         assert!(agg.flush().is_none());
+    }
+
+    /// 超上限之后不能再挑「装得下的短行」接上去 —— 那样 message 里会出现看不出来的
+    /// 断层。整条封口，末尾记一笔丢了多少。
+    #[test]
+    fn overflow_seals_the_event_instead_of_splicing() {
+        let mut agg = Aggregator::new(Arc::new(RegexParser::new())).max_bytes(64);
+        assert!(agg.push(LINE).is_none());
+        let long = "x".repeat(200);
+        assert!(agg.push(&long).is_none(), "装不下，丢掉");
+        assert!(agg.push("\tat com.foo.Bar.baz(Bar.java:42)").is_none());
+
+        let event = agg.push(LINE).expect("下一条日志到来时上一条应当闭合");
+        assert!(!event.message.contains(&long));
+        assert!(
+            !event.message.contains("Bar.java:42"),
+            "封口之后再短的行也不接：{}",
+            event.message
+        );
+        assert!(
+            event
+                .message
+                .ends_with("... [logpipe 截断：省略 2 行 / 234 字节]"),
+            "丢了要留痕：{}",
+            event.message
+        );
+    }
+
+    /// 行数上限同理，而且下一条日志要能正常开始。
+    #[test]
+    fn line_limit_seals_and_next_event_starts_clean() {
+        let mut agg = Aggregator::new(Arc::new(RegexParser::new())).max_lines(2);
+        assert!(agg.push(LINE).is_none());
+        assert!(agg.push("\tat a").is_none());
+        assert!(agg.push("\tat b").is_none());
+
+        let event = agg.push(LINE).expect("应当闭合");
+        assert!(event.message.contains("\tat a"));
+        assert!(!event.message.contains("\tat b"));
+        assert!(event.message.contains("省略 1 行"));
+
+        let next = agg.flush().expect("最后一条");
+        assert_eq!(
+            next.message, "redis延时任务触发检查,action数量0",
+            "封口状态没带到下一条"
+        );
+    }
+
+    /// 上游丢掉超长行的前半截之后，后半截不能挂到上一条日志上。
+    #[test]
+    fn discarded_giant_line_does_not_glue_its_tail_onto_the_previous_event() {
+        let mut agg = Aggregator::new(Arc::new(RegexParser::new()));
+        assert!(agg.push(LINE).is_none());
+        // FileSource 丢掉了 1 MiB 读不完的内容，剩下的尾巴随后才遇到换行
+        agg.discard(1024 * 1024);
+        assert!(agg.push("id=998,id=999) and status = 1").is_none());
+
+        let event = agg.push(LINE).expect("应当闭合");
+        assert!(
+            !event.message.contains("id=999"),
+            "残尾不该粘上来：{}",
+            event.message
+        );
+        assert!(event.message.contains("省略 2 行"));
+    }
+
+    /// 没丢东西就不该多出标记。
+    #[test]
+    fn intact_event_has_no_truncation_marker() {
+        let mut agg = Aggregator::new(Arc::new(RegexParser::new()));
+        assert!(agg.push(LINE).is_none());
+        assert!(agg.push("\tat com.foo.Bar.baz(Bar.java:42)").is_none());
+        let event = agg.push(LINE).expect("应当闭合");
+        assert!(!event.message.contains("logpipe 截断"));
     }
 
     #[test]
