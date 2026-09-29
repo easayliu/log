@@ -194,30 +194,32 @@ CREATE TABLE IF NOT EXISTS `logs`.`app_log`
     `timestamp`    DateTime64(3),
     `service_name` LowCardinality(String),
     `level`        LowCardinality(String),
-    `logger`       String,
+    `logger`       LowCardinality(String),
     `thread`       String,
     `trace_id`     String,
     `span_id`      String,
     `namespace`    LowCardinality(String),
-    `pod`          String,
+    `pod`          LowCardinality(String),
     `container`    LowCardinality(String),
     `stream`       LowCardinality(String),
     `host`         LowCardinality(String),
     `cluster`      LowCardinality(String),
-    `file`         String,
+    `file`         LowCardinality(String),
     `message`      String,
-    INDEX `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4
+    INDEX `idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(`timestamp`)
-ORDER BY (`timestamp`, `level`, `trace_id`)
-TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
+ORDER BY (`service_name`, `timestamp`, `level`, `trace_id`)
+TTL toDateTime(`timestamp`) + INTERVAL 30 DAY
+SETTINGS ttl_only_drop_parts = 1;
 
 ALTER TABLE `logs`.`app_log`
     ADD COLUMN IF NOT EXISTS `service_name` LowCardinality(String) AFTER `timestamp`,
     ADD COLUMN IF NOT EXISTS `level` LowCardinality(String) AFTER `service_name`,
     ...
-    ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4;
+    ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4,
+    MODIFY SETTING ttl_only_drop_parts = 1;
 ```
 
 （这是 `type: kubernetes` 加 `fields: {cluster: ...}` 的样子；采文件时没有 `service_name`
@@ -244,11 +246,26 @@ ALTER TABLE `logs`.`app_log`
 * ALTER 段不碰的：排序键、分区键本来就改不了；TTL 能改但 `MODIFY TTL` 会触发重算；
   已有列**类型**变了（比如 `replica` 从整数改成字符串）`IF NOT EXISTS` 会跳过 ——
   这几种本来就该人看一眼再动。
+* 排序键**服务打头**（`service_name`、`timestamp`、`level`、`trace_id`）：线上七成检索带服务
+  筛选，服务不在键里时筛选完全不减少读量，实测「服务 + 关键字」从 34 GB / 4.5 s 降到
+  2.0 GB / 0.76 s，其余查询没有变慢。采文件时没有 `service_name` 这列，键退回时间打头；
+  `fields` 里手配了 `service_name` 也算有。**老表换不了键**，只能建新表回灌再
+  `EXCHANGE TABLES`，回灌时别把 `SELECT *` 里带 JSON 的列一起灌（见下面「表结构」）。
+* `pod` / `file` / `logger` 是 `LowCardinality(String)`：一天只有几百个 pod、一两千个
+  file 和 logger，按 `String` 存一天 `file` 解压后 247 GiB，每次查日志都要读；`thread`
+  一天十几万个不同值，留 `String`。老表已有的列不会自动改类型（`MODIFY COLUMN` 要重写
+  数据，自己挑低峰做）。
+* `ttl_only_drop_parts = 1`：按天分区、TTL 也按天，到期整个 part 直接丢，不再靠 TTL 合并
+  逐行删——那种合并要把几十 GiB 的 part 整个重写。这是纯元数据设置，`ALTER` 段会给老表
+  也补上。
 * 列名必须和字段名一致，多余的列（有默认值或 Nullable）不影响插入。
 * `idx_trace_id` 是给「拿一个 trace id 反查全部日志」用的：这种查询往往不带时间范围，
-  排序键里 `trace_id` 排在 `timestamp` 后面帮不上忙，没索引就是全表扫。`ADD INDEX`
-  只管之后写入的 part，历史数据要 `ALTER TABLE ... MATERIALIZE INDEX idx_trace_id`
-  才有（重算一遍，挑低峰跑）。不需要就删掉。
+  排序键里 `trace_id` 排在 `timestamp` 后面帮不上忙，没索引就是全表扫。误判率写死 0.1%
+  而不是默认的 2.5%：30 天的表上 2.5% 意味着一条 trace 仍要读十亿行，0.1% 少读 12 倍，
+  索引只大 1.8 倍。`ADD INDEX` 只管之后写入的 part，历史数据要
+  `ALTER TABLE ... MATERIALIZE INDEX idx_trace_id` 才有（只写索引文件，不重写数据，
+  几分钟）。老表上已有默认误判率的同名索引时 `IF NOT EXISTS` 会跳过，想换要先
+  `DROP INDEX` 再重跑。不需要就删掉。
 
 ### 接 ClickHouse 集群
 
@@ -278,8 +295,9 @@ CREATE TABLE IF NOT EXISTS `logs`.`app_log_local` ON CLUSTER `bj_ck`
 ( ... )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/logs/app_log_local', '{replica}')
 PARTITION BY toYYYYMMDD(`timestamp`)
-ORDER BY (`timestamp`, `level`, `trace_id`)
-TTL toDateTime(`timestamp`) + INTERVAL 30 DAY;
+ORDER BY (`service_name`, `timestamp`, `level`, `trace_id`)
+TTL toDateTime(`timestamp`) + INTERVAL 30 DAY
+SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE IF NOT EXISTS `logs`.`app_log` ON CLUSTER `bj_ck`
 AS `logs`.`app_log_local`

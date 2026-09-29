@@ -424,7 +424,8 @@ impl Config {
             for (name, ty) in [
                 ("stream", "LowCardinality(String)"),
                 ("namespace", "LowCardinality(String)"),
-                ("pod", "String"),
+                // 一天只有几百个 pod，String 存一天解压后 76 GiB
+                ("pod", "LowCardinality(String)"),
                 ("container", "LowCardinality(String)"),
                 // pod 的 label（默认 app），和 Jaeger 的 service_name 对齐
                 ("service_name", "LowCardinality(String)"),
@@ -777,9 +778,19 @@ sink:
 "#;
         let ddl = Config::parse(base).unwrap().ddl().unwrap();
         assert!(ddl.contains("`timestamp`    DateTime64(3),"), "{ddl}");
-        // 按 trace id 反查日志用的跳数索引，单机/集群都带
+        // 按 trace id 反查日志用的跳数索引，单机/集群都带，误判率 0.1%
         assert!(
-            ddl.contains("INDEX `idx_trace_id` `trace_id` TYPE bloom_filter"),
+            ddl.contains("INDEX `idx_trace_id` `trace_id` TYPE bloom_filter(0.001)"),
+            "{ddl}"
+        );
+        // 采容器日志有 service_name，排序键服务打头；到期整 part 丢，老表也补上这个设置
+        assert!(
+            ddl.contains("ORDER BY (`service_name`, `timestamp`, `level`, `trace_id`)"),
+            "{ddl}"
+        );
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1"), "{ddl}");
+        assert!(
+            ddl.contains("MODIFY SETTING ttl_only_drop_parts = 1"),
             "{ddl}"
         );
         // 没配 timezone 就别去 MODIFY 人家手工标好时区的列
@@ -787,7 +798,7 @@ sink:
         // 老表靠幂等 ALTER 补齐：k8s 元数据列、索引都在里面，timestamp 不 ADD
         assert!(ddl.contains("ALTER TABLE `logs`.`app_log`\n"), "{ddl}");
         assert!(
-            ddl.contains("ADD COLUMN IF NOT EXISTS `pod` String"),
+            ddl.contains("ADD COLUMN IF NOT EXISTS `pod` LowCardinality(String)"),
             "{ddl}"
         );
         assert!(
@@ -932,6 +943,52 @@ sink:
             assert!(!ddl.contains(column), "多出了 {column}:\n{ddl}");
         }
         config.build().unwrap();
+    }
+
+    #[test]
+    fn file_source_has_no_service_name_so_key_starts_with_timestamp() {
+        let ddl = Config::parse(
+            r#"
+source:
+  type: file
+  include: ["/var/log/app/*.log"]
+sink:
+  type: clickhouse
+  endpoint: http://clickhouse:8123
+  database: logs
+  table: app_log
+"#,
+        )
+        .unwrap()
+        .ddl()
+        .unwrap();
+        assert!(!ddl.contains("`service_name`"), "{ddl}");
+        assert!(
+            ddl.contains("ORDER BY (`timestamp`, `level`, `trace_id`)"),
+            "{ddl}"
+        );
+        // 手配 service_name 兜底就又是服务打头
+        let ddl = Config::parse(
+            r#"
+source:
+  type: file
+  include: ["/var/log/app/*.log"]
+fields:
+  service_name: order
+sink:
+  type: clickhouse
+  endpoint: http://clickhouse:8123
+  database: logs
+  table: app_log
+"#,
+        )
+        .unwrap()
+        .ddl()
+        .unwrap();
+        assert!(
+            ddl.contains("ORDER BY (`service_name`, `timestamp`, `level`, `trace_id`)"),
+            "{ddl}"
+        );
     }
 
     #[test]

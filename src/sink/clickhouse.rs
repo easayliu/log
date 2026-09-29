@@ -15,14 +15,16 @@ use crate::sink::Sink;
 
 /// 建表时固定带的列，与 [`LogEvent`] 的固定字段一一对应。`timestamp` 的类型跟着
 /// `timezone` 走，不在这里。顺序由 [`column_rank`] 定，这里的次序无关紧要。
+/// `logger` / `file` 走 LowCardinality：一天只有一两千个不同值，按 String 存一天 `file`
+/// 解压后 247 GiB、压缩后 1.8 GiB，每次查日志都要读；`thread` 一天十几万个不同值，留 String。
 const BASE_COLUMNS: [(&str, &str); 8] = [
     ("level", "LowCardinality(String)"),
     ("trace_id", "String"),
     ("span_id", "String"),
     ("thread", "String"),
-    ("logger", "String"),
+    ("logger", "LowCardinality(String)"),
     ("message", "String"),
-    ("file", "String"),
+    ("file", "LowCardinality(String)"),
     ("host", "LowCardinality(String)"),
 ];
 
@@ -65,8 +67,9 @@ fn column_rank(name: &str) -> usize {
 
 /// 按 trace id 查日志（Jaeger 里拿到一个 id 反查全部日志）不一定带时间范围，
 /// 排序键里 trace_id 排在 timestamp 后面帮不上忙，全表扫 30 天。bloom filter
-/// 让这种查询跳过绝大多数 granule，代价是每个 granule 几十字节。
-const TRACE_ID_INDEX: &str = "`idx_trace_id` `trace_id` TYPE bloom_filter GRANULARITY 4";
+/// 让这种查询跳过绝大多数 granule。误判率不用默认的 2.5%：30 天的表上 2.5% 意味着
+/// 一条 trace 仍要读十亿行，0.1% 实测少读 12 倍，索引只大 1.8 倍（几十字节一个 granule）。
+const TRACE_ID_INDEX: &str = "`idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4";
 
 pub struct ClickhouseSink {
     client: reqwest::Client,
@@ -176,7 +179,7 @@ impl ClickhouseSink {
     ///
     /// 不碰的：排序键、分区键改不了；TTL 能改但 `MODIFY TTL` 会触发重算；已有列的类型
     /// 变了（静态字段从整数改成字符串）`IF NOT EXISTS` 会跳过 —— 这几种本来就该人看
-    /// 一眼再动。
+    /// 一眼再动。老表要换成服务打头的排序键只能建新表回灌再 `EXCHANGE TABLES`。
     pub fn create_table_ddl(&self) -> String {
         self.create_table_ddl_with(&self.extra_columns)
     }
@@ -218,9 +221,22 @@ impl ClickhouseSink {
         body.push(format!("    INDEX {TRACE_ID_INDEX}"));
         let body = body.join(",\n");
 
-        let layout = "PARTITION BY toYYYYMMDD(`timestamp`)\n\
-             ORDER BY (`timestamp`, `level`, `trace_id`)\n\
-             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY";
+        // 排序键服务打头：七成检索带服务筛选，服务不在键里时筛选完全不减少读量
+        // （线上实测「服务 + 关键字」34 GB / 4.5 s → 2.0 GB / 0.76 s，其余查询没变慢）。
+        // 采文件时没有 service_name 这列，退回按时间打头。
+        let order_by = if columns.iter().any(|(name, _)| name == "service_name") {
+            "(`service_name`, `timestamp`, `level`, `trace_id`)"
+        } else {
+            "(`timestamp`, `level`, `trace_id`)"
+        };
+        // ttl_only_drop_parts：按天分区、TTL 按天，到期整个 part 直接丢，不再靠 TTL 合并
+        // 逐行删——那种合并要把几十 GiB 的 part 整个重写一遍。
+        let layout = format!(
+            "PARTITION BY toYYYYMMDD(`timestamp`)\n\
+             ORDER BY {order_by}\n\
+             TTL toDateTime(`timestamp`) + INTERVAL 30 DAY\n\
+             SETTINGS ttl_only_drop_parts = 1"
+        );
         let db = &self.database;
         let table = &self.table;
         let modify_timestamp = self
@@ -242,6 +258,8 @@ impl ClickhouseSink {
                 .collect();
             if with_index {
                 actions.push(format!("ADD INDEX IF NOT EXISTS {TRACE_ID_INDEX}"));
+                // 纯元数据改动，重复执行无副作用；Distributed 表没有这个设置
+                actions.push("MODIFY SETTING ttl_only_drop_parts = 1".to_owned());
             }
             actions.extend(modify_timestamp.clone());
             format!(
