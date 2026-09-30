@@ -206,7 +206,8 @@ CREATE TABLE IF NOT EXISTS `logs`.`app_log`
     `cluster`      LowCardinality(String),
     `file`         LowCardinality(String),
     `message`      String,
-    INDEX `idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4
+    INDEX `idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha'),
+    INDEX `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(`timestamp`)
@@ -218,7 +219,8 @@ ALTER TABLE `logs`.`app_log`
     ADD COLUMN IF NOT EXISTS `service_name` LowCardinality(String) AFTER `timestamp`,
     ADD COLUMN IF NOT EXISTS `level` LowCardinality(String) AFTER `service_name`,
     ...
-    ADD INDEX IF NOT EXISTS `idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4,
+    ADD INDEX IF NOT EXISTS `idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha'),
+    ADD INDEX IF NOT EXISTS `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array'),
     MODIFY SETTING ttl_only_drop_parts = 1;
 ```
 
@@ -259,13 +261,20 @@ ALTER TABLE `logs`.`app_log`
   逐行删——那种合并要把几十 GiB 的 part 整个重写。这是纯元数据设置，`ALTER` 段会给老表
   也补上。
 * 列名必须和字段名一致，多余的列（有默认值或 Nullable）不影响插入。
-* `idx_trace_id` 是给「拿一个 trace id 反查全部日志」用的：这种查询往往不带时间范围，
-  排序键里 `trace_id` 排在 `timestamp` 后面帮不上忙，没索引就是全表扫。误判率写死 0.1%
-  而不是默认的 2.5%：30 天的表上 2.5% 意味着一条 trace 仍要读十亿行，0.1% 少读 12 倍，
-  索引只大 1.8 倍。`ADD INDEX` 只管之后写入的 part，历史数据要
-  `ALTER TABLE ... MATERIALIZE INDEX idx_trace_id` 才有（只写索引文件，不重写数据，
-  几分钟）。老表上已有默认误判率的同名索引时 `IF NOT EXISTS` 会跳过，想换要先
-  `DROP INDEX` 再重跑。不需要就删掉。
+* 两个跳数索引都是 **`text` 倒排索引，需要 ClickHouse 26.2+**（官方 ClickStack 的默认日志表
+  也是这两个；`tokenbf_v1` / `ngrambf_v1` 官方已不推荐用于全文检索）。查询时直接按行号读，
+  没有 bloom filter 的误判：
+  * `idx_message_text` 管关键字检索，`hasToken(lower(message), …)` 和
+    `lower(message) LIKE '%…%'`（ASCII 部分）都能用上。线上 2026-09-30 实测，7 天不带服务按
+    19 位 id 搜，原来的 `tokenbf_v1` 236 GiB / 286 s → 0 GiB / 2.7 s，结果一致。中文短语用不上：
+    LIKE 的词典扫描只取模式里的字母数字部分。索引约为 `message` 压缩后大小的 60%。
+  * `idx_trace_id_text` 管「拿一个 trace id 反查全部日志」：这种查询往往不带时间范围，排序键里
+    `trace_id` 帮不上忙。线上全表不带时间范围，`bloom_filter(0.001)` 读 240 万 ~ 300 万行 →
+    0.8 万 ~ 1.9 万行。
+  * `ADD INDEX` 只管之后写入的 part，历史数据要 `ALTER TABLE ... MATERIALIZE INDEX <名字>
+    IN PARTITION ID '<分区>'` 才有（只写索引文件，不重写数据；线上一天 7900 万行约 6 分钟，
+    按分区逐个做别一次铺满）。老表上原来的 `idx_trace_id` bloom 不会被自动删，确认新索引
+    物化完了再 `DROP INDEX`。
 
 ### 接 ClickHouse 集群
 
@@ -386,7 +395,7 @@ where trace_id = 'e89a476882236ce0f1186d1522c8f59f'
 order by timestamp
 ```
 
-不带时间范围也不慢，`idx_trace_id` 会把没这个 id 的 granule 跳掉。
+不带时间范围也不慢，`idx_trace_id_text` 直接按倒排表取到这个 id 所在的行。
 
 ## 投递语义
 

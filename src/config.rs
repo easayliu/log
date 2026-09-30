@@ -778,11 +778,18 @@ sink:
 "#;
         let ddl = Config::parse(base).unwrap().ddl().unwrap();
         assert!(ddl.contains("`timestamp`    DateTime64(3),"), "{ddl}");
-        // 按 trace id 反查日志用的跳数索引，单机/集群都带，误判率 0.1%
+        // 关键字检索和按 trace id 反查都走 text 倒排索引，单机/集群都带
         assert!(
-            ddl.contains("INDEX `idx_trace_id` `trace_id` TYPE bloom_filter(0.001)"),
+            ddl.contains(
+                "INDEX `idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha')"
+            ),
             "{ddl}"
         );
+        assert!(
+            ddl.contains("INDEX `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("bloom_filter"), "{ddl}");
         // 采容器日志有 service_name，排序键服务打头；到期整 part 丢，老表也补上这个设置
         assert!(
             ddl.contains("ORDER BY (`service_name`, `timestamp`, `level`, `trace_id`)"),
@@ -802,7 +809,11 @@ sink:
             "{ddl}"
         );
         assert!(
-            ddl.contains("ADD INDEX IF NOT EXISTS `idx_trace_id`"),
+            ddl.contains("ADD INDEX IF NOT EXISTS `idx_trace_id_text`"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("ADD INDEX IF NOT EXISTS `idx_message_text`"),
             "{ddl}"
         );
         assert!(
@@ -876,7 +887,8 @@ sink:
             ddl.contains("ALTER TABLE `logs`.`app_log` ON CLUSTER `bj_ck`"),
             "{ddl}"
         );
-        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 1, "{ddl}");
+        // 两个 text 索引各一条，都只在本地表上
+        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 2, "{ddl}");
         let local_alter = ddl.find("ALTER TABLE `logs`.`app_log_local`").unwrap();
         let dist_alter = ddl.find("ALTER TABLE `logs`.`app_log` ON").unwrap();
         assert!(

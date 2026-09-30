@@ -65,11 +65,23 @@ fn column_rank(name: &str) -> usize {
     }
 }
 
-/// 按 trace id 查日志（Jaeger 里拿到一个 id 反查全部日志）不一定带时间范围，
-/// 排序键里 trace_id 排在 timestamp 后面帮不上忙，全表扫 30 天。bloom filter
-/// 让这种查询跳过绝大多数 granule。误判率不用默认的 2.5%：30 天的表上 2.5% 意味着
-/// 一条 trace 仍要读十亿行，0.1% 实测少读 12 倍，索引只大 1.8 倍（几十字节一个 granule）。
-const TRACE_ID_INDEX: &str = "`idx_trace_id` `trace_id` TYPE bloom_filter(0.001) GRANULARITY 4";
+/// 跳数索引，建表和老表补齐都用。两个都是 `text` 倒排索引（ClickHouse 26.2 起 GA），
+/// 查询时直接按行号读，没有 bloom filter 的误判；官方 ClickStack 的默认日志表也是这两个。
+///
+/// * `idx_message_text`：关键字检索。`hasToken(lower(message), …)` 和
+///   `lower(message) LIKE '%…%'`（ASCII 部分）都能用上。线上 2026-09-30 实测，7 天不带服务按
+///   19 位 id 搜：原来的 `tokenbf_v1` 236 GiB / 286 s → 0 GiB / 2.7 s，结果一致。
+///   索引约为 `message` 压缩后大小的 60%。
+/// * `idx_trace_id_text`：按 trace id 反查日志（往往不带时间范围，排序键里 trace_id 帮不上忙）。
+///   `array` 分词器把整个值当一个 token。线上全表不带时间范围：`bloom_filter(0.001)` 读
+///   240 万 ~ 300 万行 → 0.8 万 ~ 1.9 万行，结果一致。
+///
+/// 老表上 `ADD INDEX` 只管之后写入的 part，历史数据要 `MATERIALIZE INDEX`（只写索引文件，
+/// 不重写数据）。
+const INDEXES: [&str; 2] = [
+    "`idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha')",
+    "`idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')",
+];
 
 pub struct ClickhouseSink {
     client: reqwest::Client,
@@ -218,7 +230,7 @@ impl ClickhouseSink {
                 .iter()
                 .map(|(name, ty)| format!("    `{name}`{} {ty}", pad(name))),
         );
-        body.push(format!("    INDEX {TRACE_ID_INDEX}"));
+        body.extend(INDEXES.iter().map(|index| format!("    INDEX {index}")));
         let body = body.join(",\n");
 
         // 排序键服务打头：七成检索带服务筛选，服务不在键里时筛选完全不减少读量
@@ -257,7 +269,11 @@ impl ClickhouseSink {
                 })
                 .collect();
             if with_index {
-                actions.push(format!("ADD INDEX IF NOT EXISTS {TRACE_ID_INDEX}"));
+                actions.extend(
+                    INDEXES
+                        .iter()
+                        .map(|index| format!("ADD INDEX IF NOT EXISTS {index}")),
+                );
                 // 纯元数据改动，重复执行无副作用；Distributed 表没有这个设置
                 actions.push("MODIFY SETTING ttl_only_drop_parts = 1".to_owned());
             }
