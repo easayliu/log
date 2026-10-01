@@ -65,21 +65,28 @@ fn column_rank(name: &str) -> usize {
     }
 }
 
-/// 跳数索引，建表和老表补齐都用。两个都是 `text` 倒排索引（ClickHouse 26.2 起 GA），
+/// 跳数索引，建表和老表补齐都用。三个都是 `text` 倒排索引（ClickHouse 26.2 起 GA），
 /// 查询时直接按行号读，没有 bloom filter 的误判；官方 ClickStack 的默认日志表也是这两个。
 ///
 /// * `idx_message_text`：关键字检索。`hasToken(lower(message), …)` 和
 ///   `lower(message) LIKE '%…%'`（ASCII 部分）都能用上。线上 2026-09-30 实测，7 天不带服务按
 ///   19 位 id 搜：原来的 `tokenbf_v1` 236 GiB / 286 s → 0 GiB / 2.7 s，结果一致。
 ///   索引约为 `message` 压缩后大小的 60%。
+/// * `idx_message_cjk`：中文关键字检索，`lowerUTF8(message) LIKE '%…%'` 用得上。`splitByNonAlpha`
+///   只按 ASCII 非字母数字切，汉字和全角标点都算 token 字符，中文用不上上面那个；`asciiCJK` 一个
+///   汉字一个 token。建在 `lowerUTF8(message)` 上是因为同一个表达式只能有一个 text 索引。
+///   线上 2026-09-30 一个分片一整天不带服务，4 个汉字以上的词 88 GiB / 15 s → 0.2 ~ 41 GiB /
+///   0.45 ~ 9.5 s，结果一致；`chinese` / `icu` 分词器按上下文切词会漏行，不用。索引约为
+///   `message` 压缩后大小的 60%。
 /// * `idx_trace_id_text`：按 trace id 反查日志（往往不带时间范围，排序键里 trace_id 帮不上忙）。
 ///   `array` 分词器把整个值当一个 token。线上全表不带时间范围：`bloom_filter(0.001)` 读
 ///   240 万 ~ 300 万行 → 0.8 万 ~ 1.9 万行，结果一致。
 ///
 /// 老表上 `ADD INDEX` 只管之后写入的 part，历史数据要 `MATERIALIZE INDEX`（只写索引文件，
 /// 不重写数据）。
-const INDEXES: [&str; 2] = [
+const INDEXES: [&str; 3] = [
     "`idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha')",
+    "`idx_message_cjk` lowerUTF8(message) TYPE text(tokenizer = 'asciiCJK')",
     "`idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')",
 ];
 

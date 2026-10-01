@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS `logs`.`app_log`
     `file`         LowCardinality(String),
     `message`      String,
     INDEX `idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha'),
+    INDEX `idx_message_cjk` lowerUTF8(message) TYPE text(tokenizer = 'asciiCJK'),
     INDEX `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')
 )
 ENGINE = MergeTree
@@ -220,6 +221,7 @@ ALTER TABLE `logs`.`app_log`
     ADD COLUMN IF NOT EXISTS `level` LowCardinality(String) AFTER `service_name`,
     ...
     ADD INDEX IF NOT EXISTS `idx_message_text` lower(message) TYPE text(tokenizer = 'splitByNonAlpha'),
+    ADD INDEX IF NOT EXISTS `idx_message_cjk` lowerUTF8(message) TYPE text(tokenizer = 'asciiCJK'),
     ADD INDEX IF NOT EXISTS `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array'),
     MODIFY SETTING ttl_only_drop_parts = 1;
 ```
@@ -261,13 +263,17 @@ ALTER TABLE `logs`.`app_log`
   逐行删——那种合并要把几十 GiB 的 part 整个重写。这是纯元数据设置，`ALTER` 段会给老表
   也补上。
 * 列名必须和字段名一致，多余的列（有默认值或 Nullable）不影响插入。
-* 两个跳数索引都是 **`text` 倒排索引，需要 ClickHouse 26.2+**（官方 ClickStack 的默认日志表
-  也是这两个；`tokenbf_v1` / `ngrambf_v1` 官方已不推荐用于全文检索）。查询时直接按行号读，
+* 三个跳数索引都是 **`text` 倒排索引，需要 ClickHouse 26.2+**（官方 ClickStack 的默认日志表
+  也用前后两个；`tokenbf_v1` / `ngrambf_v1` 官方已不推荐用于全文检索）。查询时直接按行号读，
   没有 bloom filter 的误判：
   * `idx_message_text` 管关键字检索，`hasToken(lower(message), …)` 和
     `lower(message) LIKE '%…%'`（ASCII 部分）都能用上。线上 2026-09-30 实测，7 天不带服务按
     19 位 id 搜，原来的 `tokenbf_v1` 236 GiB / 286 s → 0 GiB / 2.7 s，结果一致。中文短语用不上：
-    LIKE 的词典扫描只取模式里的字母数字部分。索引约为 `message` 压缩后大小的 60%。
+    `splitByNonAlpha` 把汉字和全角标点都当 token 字符。索引约为 `message` 压缩后大小的 60%。
+  * `idx_message_cjk` 管中文关键字检索，`lowerUTF8(message) LIKE '%…%'` 用得上：`asciiCJK`
+    一个汉字一个 token。建在 `lowerUTF8` 上是因为同一个表达式只能有一个 text 索引。线上
+    2026-09-30 一个分片一整天不带服务，4 个汉字以上的词 88 GiB / 15 s → 0.2 ~ 41 GiB /
+    0.45 ~ 9.5 s，结果一致；`chinese` / `icu` 分词器会漏行。大小和上面那个相当。
   * `idx_trace_id_text` 管「拿一个 trace id 反查全部日志」：这种查询往往不带时间范围，排序键里
     `trace_id` 帮不上忙。线上全表不带时间范围，`bloom_filter(0.001)` 读 240 万 ~ 300 万行 →
     0.8 万 ~ 1.9 万行。

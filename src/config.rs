@@ -789,6 +789,12 @@ sink:
             ddl.contains("INDEX `idx_trace_id_text` `trace_id` TYPE text(tokenizer = 'array')"),
             "{ddl}"
         );
+        assert!(
+            ddl.contains(
+                "INDEX `idx_message_cjk` lowerUTF8(message) TYPE text(tokenizer = 'asciiCJK')"
+            ),
+            "{ddl}"
+        );
         assert!(!ddl.contains("bloom_filter"), "{ddl}");
         // 采容器日志有 service_name，排序键服务打头；到期整 part 丢，老表也补上这个设置
         assert!(
@@ -814,6 +820,10 @@ sink:
         );
         assert!(
             ddl.contains("ADD INDEX IF NOT EXISTS `idx_message_text`"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("ADD INDEX IF NOT EXISTS `idx_message_cjk`"),
             "{ddl}"
         );
         assert!(
@@ -887,8 +897,8 @@ sink:
             ddl.contains("ALTER TABLE `logs`.`app_log` ON CLUSTER `bj_ck`"),
             "{ddl}"
         );
-        // 两个 text 索引各一条，都只在本地表上
-        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 2, "{ddl}");
+        // 三个 text 索引各一条，都只在本地表上
+        assert_eq!(ddl.matches("ADD INDEX IF NOT EXISTS").count(), 3, "{ddl}");
         let local_alter = ddl.find("ALTER TABLE `logs`.`app_log_local`").unwrap();
         let dist_alter = ddl.find("ALTER TABLE `logs`.`app_log` ON").unwrap();
         assert!(
